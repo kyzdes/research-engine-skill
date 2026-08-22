@@ -1,0 +1,38 @@
+{
+  "name": "research-engine",
+  "version": "0.1.0",
+  "description": "Собирает по теме верифицированную базу знаний и методику поверх неё: ТЗ на ресерч, отчёты с верификаторами, своды, банк фактов, критик полноты, METHOD.md.",
+  "author": {
+    "name": "kyzdes",
+    "url": "https://github.com/kyzdes"
+  },
+  "homepage": "https://github.com/kyzdes/research-engine-skill",
+  "repository": "https://github.com/kyzdes/research-engine-skill",
+  "keywords": [
+    "research",
+    "deep-research",
+    "multi-agent",
+    "knowledge-base",
+    "synthesis",
+    "verification"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Research Engine",
+    "shortDescription": "Мультиагентный ресерч по теме: отчёты с верификацией, своды, методика",
+    "longDescription": "Конвейер, по которому собраны движки clarity, copy и aso. Тема режется на 5–16 ТЗ, на каждое агент пишет полный отчёт с источниками и датами, верификатор перепроверяет нагруженные числа по первоисточникам и достраивает отчёт (объём обязан вырасти), затем собираются своды, банк фактов с провенансом и критик полноты, а поверх базы пишется методика. Закон конвейера: ни один шаг не сжимает содержание. Прогон — партиями по 3–4 агента, с журналом и машинным аудитом стадий.",
+    "developerName": "kyzdes",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/kyzdes/research-engine-skill",
+    "defaultPrompt": [
+      "Собери базу знаний по теме: ...",
+      "Разложи тему на ТЗ для глубокого ресерча и покажи карту тем.",
+      "Прогони стадию ресерча по готовым промптам и проверь аудитом."
+    ],
+    "brandColor": "#1F6F4A"
+  }
+}

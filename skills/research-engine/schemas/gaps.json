@@ -1,0 +1,37 @@
+{
+  "type": "object",
+  "description": "Возврат критика полноты стадии critique. Пишется агентом в state/results/critique__gaps.json и возвращается тем же объектом.",
+  "additionalProperties": false,
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "абсолютный путь записанного файла GAPS.md"
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["ready", "ready-with-fixes", "not-ready"],
+      "description": "можно ли писать методику по этой базе: ready — можно, ready-with-fixes — можно после перечисленных правок, not-ready — нельзя, пока не закрыты блокеры"
+    },
+    "losses": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "потери конвейера: факты, таблицы и примеры из отчётов, не доехавшие ни в один свод; что потеряно, из какого отчёта, в какой свод дописать"
+    },
+    "holes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "дыры фактуры: вопросы, на которые ресерч не ответил; каждый — с формулировкой follow-up запроса"
+    },
+    "risks": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "риски: где движок может навредить пользователю или увести к ложному выводу"
+    },
+    "blockers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "блокеры финиша: что обязано быть закрыто до METHOD.md; пустой массив при вердикте ready"
+    }
+  },
+  "required": ["path", "verdict", "losses", "holes", "risks", "blockers"]
+}

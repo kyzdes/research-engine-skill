@@ -1,0 +1,53 @@
+{
+  "type": "object",
+  "description": "Возврат агента-ресерчера стадии research. Пишется агентом в state/results/research__<topic-slug>.json и возвращается тем же объектом.",
+  "additionalProperties": false,
+  "properties": {
+    "reportPath": {
+      "type": "string",
+      "description": "абсолютный путь записанного отчёта"
+    },
+    "topic": {
+      "type": "string",
+      "description": "слаг темы, ровно как в engine.json"
+    },
+    "headline": {
+      "type": "string",
+      "description": "главный вывод отчёта одним предложением"
+    },
+    "keyFindings": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "8-15 сильнейших выводов; каждый — развёрнутое предложение с цифрой и источником, а не заголовок раздела"
+    },
+    "hardNumbers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "ключевые числа в формате «показатель = значение (выборка и условия, кто измерял, дата, URL)»; пустой массив, если чисел в теме нет"
+    },
+    "disputes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "споры между источниками: позиция А против позиции Б, кто носитель каждой; пустой массив, если расхождений не найдено"
+    },
+    "unverified": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "что не удалось подтвердить и что именно искалось; пустой массив, если всё подтверждено"
+    },
+    "notCovered": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "вопросы ТЗ, оставшиеся без ответа, с причиной; пустой массив, если покрыты все"
+    },
+    "sourceCount": {
+      "type": "number",
+      "description": "сколько отдельных источников реально открыто и использовано"
+    },
+    "approxWords": {
+      "type": "number",
+      "description": "примерный объём отчёта в словах"
+    }
+  },
+  "required": ["reportPath", "topic", "headline", "keyFindings", "hardNumbers", "disputes", "unverified", "notCovered", "sourceCount", "approxWords"]
+}

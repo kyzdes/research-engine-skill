@@ -1,0 +1,34 @@
+{
+  "type": "object",
+  "description": "Возврат агента, который пишет один файл движка: свод, навигатор банка фактов, METHOD.md, AGENT.md. Пишется агентом в state/results/<label>.json и возвращается тем же объектом.",
+  "additionalProperties": false,
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "абсолютный путь записанного файла"
+    },
+    "summary": {
+      "type": "string",
+      "description": "3-5 предложений: что внутри, как устроено, на что опирается"
+    },
+    "sections": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "список разделов файла в порядке следования"
+    },
+    "factsCarried": {
+      "type": "number",
+      "description": "сколько отдельных фактов с цифрами перенесено из отчётов"
+    },
+    "approxWords": {
+      "type": "number",
+      "description": "примерный объём файла в словах"
+    },
+    "openIssues": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "чего в отчётах не хватило для этого документа; пустой массив, если хватило всего"
+    }
+  },
+  "required": ["path", "summary", "sections", "factsCarried", "approxWords", "openIssues"]
+}

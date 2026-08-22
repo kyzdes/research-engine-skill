@@ -1,0 +1,45 @@
+{
+  "type": "object",
+  "description": "Возврат верификатора стадии verify. Пишется агентом в state/results/verify__<topic-slug>.json и возвращается тем же объектом.",
+  "additionalProperties": false,
+  "properties": {
+    "topic": {
+      "type": "string",
+      "description": "слаг темы, ровно как в engine.json"
+    },
+    "coverageVerdict": {
+      "type": "string",
+      "enum": ["full", "partial", "weak"],
+      "description": "покрытие вопросов ТЗ после достройки: full — отвечены все, partial — есть слабо покрытые, weak — остались вопросы без ответа"
+    },
+    "checkedClaims": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "проверенные утверждения: утверждение → вердикт (подтверждено / исправлено на X / не подтверждено) → источник и дата проверки"
+    },
+    "corrections": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "что исправлено в файле отчёта; пустой массив, если ошибок не нашлось"
+    },
+    "additions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "какие разделы, таблицы и факты дописаны и куда именно"
+    },
+    "stillMissing": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "что осталось непокрытым и почему; пустой массив, если непокрытого нет"
+    },
+    "wordsBefore": {
+      "type": "number",
+      "description": "объём отчёта в словах до верификации"
+    },
+    "wordsAfter": {
+      "type": "number",
+      "description": "объём отчёта в словах после верификации; обязан быть больше wordsBefore"
+    }
+  },
+  "required": ["topic", "coverageVerdict", "checkedClaims", "corrections", "additions", "stillMissing", "wordsBefore", "wordsAfter"]
+}
