@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url'
 import {
   die, isDir, isFile, readText, todayISO, isISODate, plural,
   defaultSynthFile, isGaps, isBankNav, PROFILE_NORM, DEFAULT_FINISH, DEFAULT_WORDS,
-  strList, normalizeBrief, briefFindings, renderBriefMd,
+  strList, normalizeBrief, briefFindings, renderBriefMd, DEFAULT_MODELS, DEFAULT_EFFORTS, ROUTE_KEYS,
 } from './lib/engine.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -45,6 +45,8 @@ answers.json — объект с любым подмножеством поле�
   brief { request, restated, users, jobs, decisions, deliverables,
           acceptance:[{ id, question, job }], assumptions, constraints, known,
           inputs:[{ ref, kind, use, trust }], sources { must, avoid }, freshness, openQuestions },
+  models { <стадия>: opus|sonnet|haiku|<id> }, efforts { <стадия>: low|medium|high|xhigh|max }
+         стадии: ${ROUTE_KEYS.join(", ")} — bank это части банка фактов,
   topics [ { slug, title, what, feeds:[label], answers:[A1], status } ],
   syntheses [ { label, file, title, primary:[slug], secondary:[slug], status } ]
 
@@ -111,6 +113,7 @@ function loadAnswers(file) {
 const KNOWN_ANSWER_KEYS = new Set([
   'root', 'slug', 'title', 'language', 'profile', 'finish', 'today', 'createdAt',
   'mission', 'perimeter', 'targetWords', 'topics', 'syntheses', 'version', 'runs', 'brief',
+  'models', 'efforts',
 ])
 
 // ---------------------------------------------------------------- нормализация состояния
@@ -278,6 +281,21 @@ const brief = {
   assumptions: nb.assumptions, constraints: nb.constraints, known: nb.known,
   inputs: nb.inputs, sources: nb.sources, freshness: nb.freshness, openQuestions: nb.openQuestions,
 }
+// Маршрут моделей по стадиям: умолчания из lib/engine.mjs, поверх — ответы интейка. Пишется в
+// engine.json явно, чтобы маршрут был виден и правился в одном месте.
+const pickRoute = (defaults, given, name) => {
+  const out = { ...defaults }
+  if (given && typeof given === 'object' && !Array.isArray(given)) {
+    for (const [k, v] of Object.entries(given)) {
+      if (!ROUTE_KEYS.includes(k)) { warns.push(name + '.' + k + ' — такой стадии нет, допустимы: ' + ROUTE_KEYS.join(', ')); continue }
+      if (v) out[k] = String(v)
+    }
+  }
+  return out
+}
+const models = pickRoute(DEFAULT_MODELS, answers.models, 'models')
+const efforts = pickRoute(DEFAULT_EFFORTS, answers.efforts, 'efforts')
+
 const acceptanceIds = new Set(brief.acceptance.map(a => a.id))
 for (const t of topics) {
   for (const id of t.answers) {
@@ -371,6 +389,8 @@ const engineJson = {
   mission,
   perimeter: { in: perimeterIn, out: perimeterOut },
   brief,
+  models,
+  efforts,
   targetWords,
   topics,
   syntheses,

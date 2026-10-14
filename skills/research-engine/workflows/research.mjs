@@ -1,7 +1,7 @@
 export const meta = {
   name: 'research-engine-research',
   description: 'Стадия ресерча движка: агент на тему пишет полный отчёт по файлу задачи, верификатор проверяет числа и достраивает тот же отчёт',
-  whenToUse: 'После того как render-tasks.mjs отрендерил state/tasks/. args: { root: "/abs/path/<slug>-engine", labels: ["01-slug", "02-slug"], stage?: "research" | "verify", verify?: true, effort?: "high", model?: "<id>", schemas?: {} }. stage "verify" — только верификатор поверх готового отчёта: так добиваются verifyFailed и notGrown, не переписывая отчёт заново. Партия — 3-4 темы за вызов: девять тяжёлых агентов разом выжигают лимит сессии.',
+  whenToUse: 'После того как render-tasks.mjs отрендерил state/tasks/. args: { root: "/abs/path/<slug>-engine", labels: ["01-slug", "02-slug"], stage?: "research" | "verify", verify?: true, models?: { research: "sonnet", verify: "opus" }, efforts?: { research: "high", verify: "high" }, model?: "<id>", effort?: "high", schemas?: {} }. models и efforts — маршрут по ролям, его печатают render-tasks.mjs и status.mjs из engine.json; model и effort — одно значение на обе роли. stage "verify" — только верификатор поверх готового отчёта: так добиваются verifyFailed и notGrown, не переписывая отчёт заново. Партия — 3-4 темы за вызов: девять тяжёлых агентов разом выжигают лимит сессии.',
   phases: [
     { title: 'Research', detail: 'агент на тему читает state/tasks/research__<slug>.md и пишет полный отчёт в reports/' },
     { title: 'Verify', detail: 'верификатор читает state/tasks/verify__<slug>.md, перепроверяет числа и достраивает тот же отчёт' },
@@ -33,12 +33,19 @@ if (!labels.length) {
 
 const ONLY_VERIFY = STAGE === 'verify'
 const WITH_VERIFY = ONLY_VERIFY || (A.verify !== false && A.verify !== 'false' && A.verify !== 0)
-const EFFORT = A.effort || 'high'
-// Модель не задана — агент наследует модель сессии; это почти всегда правильно.
-const MODEL = A.model ? String(A.model) : ''
+// Маршрут по ролям: ресерчеру — объём с веб-поиском, верификатору — суждение. Значения приходят
+// в args.models / args.efforts из engine.json (исполнитель файлов не видит); args.model и
+// args.effort — одно значение на обе роли. Модели нет нигде — агент наследует модель сессии.
+const pick = (o) => (o && typeof o === 'object' && !Array.isArray(o) ? o : {})
+const MODELS = pick(A.models)
+const EFFORTS = pick(A.efforts)
+const routeOf = (role) => ({ model: String(MODELS[role] || A.model || ''), effort: String(EFFORTS[role] || A.effort || 'high') })
 const OVERRIDE = A.schemas || {}
 
-const agentOpts = (label, phase, schema) => Object.assign({ label, phase, schema, effort: EFFORT }, MODEL ? { model: MODEL } : {})
+const agentOpts = (label, phase, schema, role) => {
+  const r = routeOf(role)
+  return Object.assign({ label, phase, schema, effort: r.effort }, r.model ? { model: r.model } : {})
+}
 
 const RESEARCH_SCHEMA = OVERRIDE.research || {
   type: 'object',
@@ -89,13 +96,13 @@ const researchPrompt = (slug) => wrap('research__' + slug, 'Ты ресерче�
 
 const verifyPrompt = (slug) => wrap('verify__' + slug, 'Ты верификатор и достройщик отчёта по теме ' + slug + '. Твоя работа делает отчёт полнее и надёжнее, а не короче: объём после тебя обязан вырасти. Ничего не удаляй; опровергнутое утверждение переписывается с пометкой «опровергнуто» и источником опровержения, но остаётся в тексте.')
 
-const verifyAgent = (slug) => agent(verifyPrompt(slug), agentOpts('verify__' + slug, 'Verify', VERIFY_SCHEMA))
+const verifyAgent = (slug) => agent(verifyPrompt(slug), agentOpts('verify__' + slug, 'Verify', VERIFY_SCHEMA, 'verify'))
 
 phase(ONLY_VERIFY ? 'Verify' : 'Research')
 log('Тем в партии: ' + labels.length + ' — ' + labels.join(', ') +
   (ONLY_VERIFY ? ' · только верификация (args.stage = verify), отчёты не переписываются'
     : WITH_VERIFY ? ' · с верификацией' : ' · без верификации (args.verify = false)') +
-  (MODEL ? ' · модель ' + MODEL : ''))
+  ' · модели: ' + (ONLY_VERIFY ? '' : 'ресерчер ' + (routeOf('research').model || 'сессии') + ', ') + 'верификатор ' + (routeOf('verify').model || 'сессии'))
 if (labels.length > 4) log('Внимание: партия больше четырёх тем. Прошлый прогон девяти тяжёлых агентов разом сжёг лимит сессии за пять минут; безопасная партия — 3-4 темы.')
 
 const results = ONLY_VERIFY
@@ -103,7 +110,7 @@ const results = ONLY_VERIFY
   : await pipeline(
       labels,
 
-      (slug) => agent(researchPrompt(slug), agentOpts('research__' + slug, 'Research', RESEARCH_SCHEMA)),
+      (slug) => agent(researchPrompt(slug), agentOpts('research__' + slug, 'Research', RESEARCH_SCHEMA, 'research')),
 
       (res, slug) => {
         if (!res) return null
@@ -135,7 +142,7 @@ return {
   stage: STAGE,
   root: ROOT,
   verify: WITH_VERIFY,
-  model: MODEL || 'модель сессии',
+  models: { research: ONLY_VERIFY ? null : routeOf('research').model || 'модель сессии', verify: WITH_VERIFY ? routeOf('verify').model || 'модель сессии' : null },
   reports: done.map(d => ({
     topic: d.slug,
     path: d.research ? d.research.reportPath : ROOT + '/reports/' + d.slug + '.md',

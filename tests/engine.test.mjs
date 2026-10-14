@@ -305,3 +305,50 @@ test('разведка видит решённое с заказчиком и д
   assert.match(t, /Уже решено с заказчиком[^\n]*\n- база с нуля, не дельта/)
   assert.match(t, /- рынки US и RU — не подтверждено/)
 })
+
+// ---------------------------------------------------------------- маршрут моделей
+
+test('маршрут моделей: умолчания в engine.json, части банка дешевле плейбуков, переопределение', async () => {
+  const lib = await import(path.join(SCRIPTS, 'lib', 'engine.mjs'))
+  const root = makeEngine()
+  const e = readEngine(root)
+  assert.equal(e.models.verify, 'opus')
+  assert.equal(e.models.research, 'sonnet')
+  assert.equal(e.efforts.research, 'high')
+  const bankPart = e.syntheses.find(s => s.label === 'facts-bank-a')
+  const playbook = e.syntheses.find(s => s.label === 'field-spec')
+  assert.equal(lib.routeFor(e, 'synth', bankPart).model, 'sonnet')
+  assert.equal(lib.routeFor(e, 'synth', playbook).model, 'opus')
+  assert.equal(lib.routeFor({ models: { research: 'haiku' } }, 'research').model, 'haiku')
+  assert.deepEqual(lib.workflowArgs(e, root, 'synth', ['field-spec', 'facts-bank-a']).models, { 'field-spec': 'opus', 'facts-bank-a': 'sonnet' })
+  assert.deepEqual(lib.workflowArgs(e, root, 'research', ['01-alpha']).models, { research: 'sonnet', verify: 'opus' })
+})
+
+test('render-tasks и status печатают аргументы исполнителя с маршрутом моделей', () => {
+  const root = makeEngine()
+  const r = run('render-tasks.mjs', ['--root', root, '--stage', 'research'])
+  assert.match(r.out, /"models":\{"research":"sonnet","verify":"opus"\}/)
+  const st = JSON.parse(run('status.mjs', ['--root', root, '--json']).out)
+  assert.match(st.next.text, /"models":\{"research":"sonnet","verify":"opus"\}/)
+})
+
+test('fanout на claude берёт модель по стадии, флаг сильнее; на codex маршрут не подставляется', () => {
+  const root = makeEngine()
+  assert.equal(run('render-tasks.mjs', ['--root', root, '--stage', 'synth']).code, 0)
+  const c = run('fanout.mjs', ['--root', root, '--stage', 'synth', '--engine', 'claude', '--dry-run']).out
+  const block = (label) => c.split('# ' + label + '\n')[1].split('\n\n')[0]
+  assert.match(block('synth__field-spec'), /--model opus --effort high/)
+  assert.match(block('synth__facts-bank-a'), /--model sonnet --effort medium/)
+  const forced = run('fanout.mjs', ['--root', root, '--stage', 'synth', '--engine', 'claude', '--model', 'haiku', '--dry-run']).out
+  assert.doesNotMatch(forced, /--model (opus|sonnet)/)
+  const codex = run('fanout.mjs', ['--root', root, '--stage', 'synth', '--engine', 'codex', '--dry-run']).out
+  assert.doesNotMatch(codex, / -m (opus|sonnet)/)
+})
+
+test('исполнители раздают модели по ролям и задачам', async () => {
+  const r = await runWorkflow('research.mjs', { root: '/tmp/x-engine', labels: ['01-alpha'], models: { research: 'sonnet', verify: 'opus' }, efforts: { research: 'high', verify: 'xhigh' } })
+  assert.deepEqual(r.calls.map(c => [c.label, c.model, c.effort]), [['research__01-alpha', 'sonnet', 'high'], ['verify__01-alpha', 'opus', 'xhigh']])
+  const s = await runWorkflow('synthesis.mjs', { root: '/tmp/x-engine', stage: 'synth', labels: ['field-spec', 'facts-bank-a'], models: { 'field-spec': 'opus', 'facts-bank-a': 'sonnet' } })
+  assert.deepEqual(s.calls.map(c => [c.label, c.model]), [['synth__field-spec', 'opus'], ['synth__facts-bank-a', 'sonnet']])
+  assert.deepEqual(s.result.models, { 'field-spec': 'opus', 'facts-bank-a': 'sonnet' })
+})

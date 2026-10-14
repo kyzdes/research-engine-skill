@@ -12,6 +12,7 @@ import {
   STAGES, DEFAULT_FINISH, DEFAULT_WORDS, normalizeEngine, synthFileName, isGaps,
   bankLayout, synthStageEntries, syncToolchain, toolchainDrift,
   normalizeBrief, jobsText, acceptanceText, inputsText, sourcesText, strList, MISSION_STUB_RE,
+  workflowArgs,
 } from './lib/engine.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -461,16 +462,19 @@ const script = (name) => path.join(SKILL, 'scripts', name)
 const afterBatch = 'После партии: node ' + script('status.mjs') + ' --root ' + ROOT +
   ' --write (статусы тем и сводов, строка в state/run-log.md), затем node ' + script('audit.mjs') + ' --root ' + ROOT + '.'
 const codexRun = 'node ' + script('fanout.mjs') + ' --root ' + ROOT + ' --stage ' + STAGE + ' --engine codex --concurrency 3'
+// Готовые аргументы исполнителя на первую партию: маршрут моделей и усилий из engine.json.
+const shorts = tasks.map(t => t.short).slice(0, STAGE === 'research' || STAGE === 'verify' || STAGE === 'synth' ? 4 : tasks.length)
+const wfArgs = JSON.stringify(workflowArgs(engine, ROOT, STAGE, shorts))
 
 console.log('')
 if (argv.dryRun) {
   console.log('Дальше: повтори без --dry-run, чтобы записать файлы задач.')
 } else if (STAGE === 'recon') {
-  console.log('Дальше: Workflow ' + ROOT + '/workflows/synthesis.mjs с args.stage = "recon" и args.labels = ["field"] (один агент, можно effort "medium"), либо ' + codexRun + '. Пока он идёт — первый круг вопросов заказчику о работе базы (references/BRIEF.md §3). Потом: прочитай brief/RECON.md, второй круг вопросов, заполни brief в engine.json и node ' + script('brief.mjs') + ' --root ' + ROOT + ' --write.')
+  console.log('Дальше: Workflow ' + ROOT + '/workflows/synthesis.mjs с args ' + wfArgs + ', либо ' + codexRun + '. Пока он идёт — первый круг вопросов заказчику о работе базы (references/BRIEF.md §3). Потом: прочитай brief/RECON.md, второй круг вопросов, заполни brief в engine.json и node ' + script('brief.mjs') + ' --root ' + ROOT + ' --write.')
 } else if (STAGE === 'research') {
-  console.log('Дальше: партия 3-4 темы — Workflow ' + ROOT + '/workflows/research.mjs с args.labels из колонки label (префикс стадии можно не писать; верификатор идёт следом сам), либо ' + codexRun + '. ' + afterBatch)
+  console.log('Дальше: партия 3-4 темы — Workflow ' + ROOT + '/workflows/research.mjs, первая партия с args ' + wfArgs + ' (верификатор идёт следом сам; следующие партии — те же args с другими labels), либо ' + codexRun + '. ' + afterBatch)
 } else if (STAGE === 'verify') {
-  console.log('Дальше: Workflow ' + ROOT + '/workflows/research.mjs с args.stage = "verify" — только верификатор, отчёт не пишется заново; либо ' + codexRun + '. ' + afterBatch)
+  console.log('Дальше: Workflow ' + ROOT + '/workflows/research.mjs с args ' + wfArgs + ' — только верификатор, отчёт не пишется заново; либо ' + codexRun + '. ' + afterBatch)
 } else {
-  console.log('Дальше: партия 3-4 задачи — Workflow ' + ROOT + '/workflows/synthesis.mjs с args.stage = "' + STAGE + '" и args.labels из колонки label, либо ' + codexRun + '. ' + afterBatch)
+  console.log('Дальше: партия 3-4 задачи — Workflow ' + ROOT + '/workflows/synthesis.mjs, ' + (tasks.length > shorts.length ? 'первая партия ' : '') + 'с args ' + wfArgs + ', либо ' + codexRun + '. ' + afterBatch)
 }

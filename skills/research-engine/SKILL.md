@@ -4,7 +4,7 @@ description: >-
   Run a full multi-agent deep-research pipeline on any topic and produce a verified knowledge base — it starts with a brief (the raw request is sharpened, a recon agent maps the field, the user is asked what job the base must do, acceptance questions and the user's own materials are collected), then the topic is split into 5–16 research briefs, each gets its own agent report, each report gets a verifier that re-checks the loaded numbers against primary sources and EXTENDS the report, then syntheses, a facts bank with provenance, a completeness critic, and a METHOD.md written on top. Use when the user asks to «собрать базу знаний по теме», «сделать глубокий ресерч», «мультиагентный ресерч», «разложить тему на ТЗ», «собрать движок по теме X», «прогнать deep research по нескольким направлениям», «свести отчёты в методику», «уточни, какую задачу должна решать база», or asks to continue/audit an existing engine (ENGINE.md, engine.json, reports/, synthesis/ on disk). Works in Claude Code (Workflow executors) and in Codex (portable runner over codex exec). NOT for a single question answerable by web search, a one-off summary of one article, or code-only research inside a repository — those are ordinary work, not an engine.
 metadata:
   short-description: "Мультиагентный ресерч по теме: ТЗ → отчёты с верификацией → своды → методика"
-  version: "0.2"
+  version: "0.3"
 ---
 
 # Движок ресерча
@@ -96,6 +96,22 @@ metadata:
 → **Останов:** сдача.
 
 Финиш `base` останавливает конвейер после стадии 4: база знаний без методики поверх неё.
+
+## Модели по стадиям
+
+Движок сам отдаёт задачу подходящей модели. Маршрут лежит в `engine.json` (поля `models` и `efforts`, их пишет `engine-init.mjs`), а `render-tasks.mjs` и `status.mjs` печатают готовые аргументы исполнителя с ним. Workflow-исполнители раздают модели по ролям и задачам, `fanout.mjs --engine claude` — по стадии каждой задачи.
+
+| Стадия | Модель | Усилие | Почему |
+|---|---|---|---|
+| `recon`, `research` | sonnet | medium, high | объём с веб-поиском: много страниц, длинный отчёт |
+| `verify` | opus | high | суждение: перепроверка нагруженных чисел и достройка |
+| `synth` — плейбуки, справочники, линтер, вердикты | opus | high | проектирование процедуры из корпуса без потерь |
+| `bank` — части банка фактов | sonnet | medium | аккуратный перенос строк таблиц, не суждение |
+| `merge` — навигатор банка | sonnet | medium | карта по оглавлениям частей |
+| `critique`, `method` | opus | high | ревизия и законы методики |
+| `agent-doc` | sonnet | medium | карточка входа поверх готовой методики |
+
+Haiku по умолчанию не стоит нигде: каждая стадия либо судит, либо переносит большой текст без сжатия, а маленькая модель слабее всего именно в этом. Поставить её можно на любую стадию правкой `models` в `engine.json` — например, на `agent-doc` для экономии. Без поля `models` и аргументов агент наследует модель сессии.
 
 ## Профили
 

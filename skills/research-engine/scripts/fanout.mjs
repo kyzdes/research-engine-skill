@@ -24,7 +24,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { STAGES, PREFIX_BY_STAGE, normalizeEngine, stageLabels, appendRunLogRow, todayISO } from './lib/engine.mjs'
+import { STAGES, PREFIX_BY_STAGE, normalizeEngine, stageLabels, appendRunLogRow, todayISO, routeFor, stageOfLabel } from './lib/engine.mjs'
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const SKILL_DIR = path.resolve(SCRIPT_DIR, '..')
@@ -62,8 +62,12 @@ const HELP = `fanout.mjs — исполнитель стадии движка р
 Опции:
   --engine codex|claude    чем поднимать агента (по умолчанию codex)
   --concurrency <n>        сколько агентов одновременно (по умолчанию 3)
-  --model <m>              модель агента (по умолчанию — настройка хоста)
-  --effort <level>         усилие рассуждения; для claude это --effort
+  --model <m>              модель агента на все задачи. Без флага на хосте claude модель
+                           берётся по стадии из models в engine.json (верификатор,
+                           плейбуки, критик, методика — opus; ресерч, части банка,
+                           навигатор — sonnet); на codex — настройка хоста
+  --effort <level>         усилие рассуждения; для claude это --effort, без флага —
+                           по стадии из efforts в engine.json
                            (low|medium|high|xhigh|max), для codex это
                            -c model_reasoning_effort="<level>"
   --retries <n>            повторов после первого провала (по умолчанию 1)
@@ -183,6 +187,7 @@ function loadEngine(root) {
   // §3: скрипт переживает отсутствие необязательных полей и не падает на лишних.
   const { topics, syntheses } = normalizeEngine(e)
   return {
+    raw: e,
     slug: typeof e.slug === 'string' ? e.slug : '',
     title: typeof e.title === 'string' ? e.title : '',
     topics,
@@ -262,7 +267,17 @@ function taskPrompt(root, label, opts) {
 
 // ---------------------------------------------------------------- команды
 
-function buildCommand(label, opts, root) {
+// Маршрут задачи: флаг командной строки сильнее engine.json. Псевдонимы моделей Claude (opus,
+// sonnet, haiku) кодексу не годятся, поэтому на codex маршрут из engine.json не подставляется.
+function routeOfJob(label, opts, engine) {
+  if (opts.engine !== 'claude') return { model: opts.model, effort: opts.effort }
+  const stage = stageOfLabel(label)
+  const entry = stage === 'synth' ? engine.syntheses.find(s => 'synth__' + s.label === label) : null
+  const r = routeFor(engine.raw, stage, entry)
+  return { model: opts.model || r.model, effort: opts.effort || r.effort }
+}
+
+function buildCommand(label, opts, root, route) {
   const rawPath = path.join(root, 'state', 'results', label + '.raw.json')
   const logPath = path.join(root, 'state', 'logs', label + '.log')
   const prompt = taskPrompt(root, label, opts)
@@ -283,8 +298,8 @@ function buildCommand(label, opts, root) {
     // --strict-config превращает опечатку в ключе в громкую ошибку вместо тихого «без интернета».
     if (opts.strictConfig) args.push('--strict-config')
     args.push('-c', 'tools.web_search=' + (opts.webSearch ? 'true' : 'false'))
-    if (opts.model) args.push('-m', opts.model)
-    if (opts.effort) args.push('-c', 'model_reasoning_effort="' + opts.effort + '"')
+    if (route.model) args.push('-m', route.model)
+    if (route.effort) args.push('-c', 'model_reasoning_effort="' + route.effort + '"')
     args.push(prompt)
     return { cmd: 'codex', args, rawPath, logPath, schema, captureStdout: false }
   }
@@ -297,8 +312,8 @@ function buildCommand(label, opts, root) {
   // Проверено 22.08.2026. Поэтому после --add-dir всегда стоит флаг со своим значением,
   // а промпт идёт последним позиционным.
   const args = ['-p', '--permission-mode', opts.permissionMode, '--add-dir', root, '--output-format', 'json']
-  if (opts.model) args.push('--model', opts.model)
-  if (opts.effort) args.push('--effort', opts.effort)
+  if (route.model) args.push('--model', route.model)
+  if (route.effort) args.push('--effort', route.effort)
   args.push(prompt)
   return { cmd: 'claude', args, rawPath, logPath, schema: '', captureStdout: true }
 }
@@ -529,8 +544,8 @@ function table(jobs, results) {
 function appendRunLog(root, opts, jobs, results, sec) {
   const ok = jobs.filter(j => (results.get(j.label) || {}).ok).map(j => j.label)
   const failed = jobs.map(j => j.label).filter(l => !ok.includes(l))
-  const note = 'fanout · параллельно ' + opts.concurrency + ' · модель ' + (opts.model || 'по умолчанию хоста') +
-    ' · усилие ' + (opts.effort || 'по умолчанию хоста') + ' · веб-поиск ' + (opts.webSearch ? 'вкл' : 'выкл') +
+  const routes = [...new Set(jobs.map(j => (j.route.model || 'хоста') + '/' + (j.route.effort || 'хоста')))].join(', ')
+  const note = 'fanout · параллельно ' + opts.concurrency + ' · модель/усилие ' + routes + ' · веб-поиск ' + (opts.webSearch ? 'вкл' : 'выкл') +
     ' · ' + Math.round(sec / 60) + ' мин' + (failed.length ? ' · упали: ' + failed.join(', ') : '')
   try {
     appendRunLogRow(root, [
@@ -568,9 +583,11 @@ if (opts.skipDone) {
 }
 
 const jobs = labels.map(l => {
-  const j = buildCommand(l, opts, opts.root)
+  const route = routeOfJob(l, opts, engine)
+  const j = buildCommand(l, opts, opts.root, route)
   j.label = l
   j.cwd = opts.root
+  j.route = route
   return j
 })
 
@@ -604,6 +621,7 @@ if (opts.dryRun) {
     console.log('#   raw:    ' + j.rawPath)
     if (j.schema) console.log('#   схема:  ' + j.schema)
     console.log('#   cwd:    ' + j.cwd)
+    console.log('#   модель: ' + (j.route.model || 'по умолчанию хоста') + ' · усилие: ' + (j.route.effort || 'по умолчанию хоста'))
     console.log(renderCommand(j))
     console.log('')
   }

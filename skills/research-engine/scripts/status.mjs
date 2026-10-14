@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 import {
   die, isDir, isFile, readText, readJson, countWords, fmt, todayISO,
   normalizeEngine, synthFileName, isGaps, bankLayout, synthStageEntries, findVerificationHeading,
-  appendRunLogRow, toolchainDrift, DEFAULT_FINISH, briefFindings,
+  appendRunLogRow, toolchainDrift, DEFAULT_FINISH, briefFindings, workflowArgs,
 } from './lib/engine.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -130,7 +130,8 @@ if (drift.length) {
 function nextStep() {
   const render = (stage, labels) => 'node ' + script('render-tasks.mjs') + ' --root ' + ROOT + ' --stage ' + stage +
     (labels ? ' --labels ' + labels.join(',') : '')
-  const wf = (file, extra) => 'Workflow ' + path.join(ROOT, 'workflows', file) + ' с args ' + JSON.stringify({ root: ROOT, ...extra })
+  // аргументы исполнителя с маршрутом моделей и усилий из engine.json
+  const wf = (file, stage, labels) => 'Workflow ' + path.join(ROOT, 'workflows', file) + ' с args ' + JSON.stringify(workflowArgs(raw, ROOT, stage, labels))
 
   if (!topics.length) {
     const bf = briefFindings(raw, ROOT)
@@ -146,7 +147,7 @@ function nextStep() {
     return {
       stage: 'research', labels: batch,
       text: 'ресерч, партия ' + batch.length + ' из ' + planned.length + ' непрогнанных тем:\n    ' +
-        render('research', batch) + '\n    ' + wf('research.mjs', { labels: batch }),
+        render('research', batch) + '\n    ' + wf('research.mjs', 'research', batch),
     }
   }
   const unverified = topicRows.filter(r => r.derived === 'researched').map(r => r.slug)
@@ -155,7 +156,7 @@ function nextStep() {
     return {
       stage: 'verify', labels: batch,
       text: 'верификация без повторного ресерча, ' + batch.length + ' из ' + unverified.length + ':\n    ' +
-        render('verify', batch) + '\n    ' + wf('research.mjs', { stage: 'verify', labels: batch }),
+        render('verify', batch) + '\n    ' + wf('research.mjs', 'verify', batch),
     }
   }
   const synthTodo = synthStageEntries(syntheses).map(s => synthRows.find(r => r.label === String(s.label)))
@@ -165,15 +166,15 @@ function nextStep() {
     return {
       stage: 'synth', labels: batch,
       text: 'своды, партия ' + batch.length + ' из ' + synthTodo.length + ':\n    ' +
-        render('synth', batch) + '\n    ' + wf('synthesis.mjs', { stage: 'synth', labels: batch }),
+        render('synth', batch) + '\n    ' + wf('synthesis.mjs', 'synth', batch),
     }
   }
   const nav = synthRows.find(r => r.role === 'merge')
   if (nav && nav.derived !== 'done') {
-    return { stage: 'merge', labels: ['facts-bank'], text: 'навигатор банка фактов:\n    ' + render('merge') + '\n    ' + wf('synthesis.mjs', { stage: 'merge', labels: ['facts-bank'] }) }
+    return { stage: 'merge', labels: ['facts-bank'], text: 'навигатор банка фактов:\n    ' + render('merge') + '\n    ' + wf('synthesis.mjs', 'merge', ['facts-bank']) }
   }
   if (!gapsPresent) {
-    return { stage: 'critique', labels: ['gaps'], text: 'критик полноты:\n    ' + render('critique') + '\n    ' + wf('synthesis.mjs', { stage: 'critique', labels: ['gaps'] }) }
+    return { stage: 'critique', labels: ['gaps'], text: 'критик полноты:\n    ' + render('critique') + '\n    ' + wf('synthesis.mjs', 'critique', ['gaps']) }
   }
   if (finish === 'base') {
     return { stage: 'done', text: 'финиш base: конвейер доведён до GAPS.md. Прочитай его с пользователем и прогони node ' + script('audit.mjs') + ' --root ' + ROOT }
@@ -182,7 +183,7 @@ function nextStep() {
     if (f.words) continue
     if (f.stage === 'index') return { stage: 'index', text: 'карта сводов: node ' + script('build-index.mjs') + ' --root ' + ROOT }
     const label = f.stage === 'method' ? 'method' : 'agent'
-    return { stage: f.stage, labels: [label], text: f.name + ':\n    ' + render(f.stage) + '\n    ' + wf('synthesis.mjs', { stage: f.stage, labels: [label] }) }
+    return { stage: f.stage, labels: [label], text: f.name + ':\n    ' + render(f.stage) + '\n    ' + wf('synthesis.mjs', f.stage, [label]) }
   }
   return { stage: 'done', text: 'все файлы на месте. Финальная проверка: node ' + script('audit.mjs') + ' --root ' + ROOT + ', затем чек-лист сдачи из SKILL.md' }
 }

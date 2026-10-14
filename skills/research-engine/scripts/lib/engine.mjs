@@ -128,6 +128,64 @@ export function stageLabels(stage, engine) {
   return []
 }
 
+// ---------------------------------------------------------------- модели по стадиям
+
+// Какой модели отдавать задачу. Правило: суждение и проверка — сильнейшей модели (верификатор,
+// сводчик плейбуков, критик, автор методики); объём с веб-поиском и перенос без сжатия —
+// средней (разведка, ресерч, части банка фактов, навигатор, AGENT.md). Маленькая модель по
+// умолчанию не стоит нигде: каждая стадия либо судит, либо переносит большой текст без потерь,
+// а это ровно то, в чём она слабее всего. Переопределяется полями models и efforts в engine.json.
+export const DEFAULT_MODELS = {
+  recon: 'sonnet', research: 'sonnet', verify: 'opus', synth: 'opus', bank: 'sonnet',
+  merge: 'sonnet', critique: 'opus', method: 'opus', 'agent-doc': 'sonnet',
+}
+export const DEFAULT_EFFORTS = {
+  recon: 'medium', research: 'high', verify: 'high', synth: 'high', bank: 'medium',
+  merge: 'medium', critique: 'high', method: 'high', 'agent-doc': 'medium',
+}
+export const ROUTE_KEYS = Object.keys(DEFAULT_MODELS)
+
+// Части банка фактов идут отдельным ключом bank: перенос тысяч строк таблиц требует
+// аккуратности, а не суждения, и на сильнейшей модели это дорого без выигрыша.
+export const routeKey = (stage, synthEntry) => (stage === 'synth' && synthEntry && isBankPart(synthEntry) ? 'bank' : stage)
+
+export function routeFor(raw, stage, synthEntry) {
+  const key = routeKey(stage, synthEntry)
+  const pick = (o) => (o && typeof o === 'object' && !Array.isArray(o) ? o : {})
+  const m = pick(raw && raw.models)
+  const ef = pick(raw && raw.efforts)
+  return { key, model: String(m[key] || DEFAULT_MODELS[key] || ''), effort: String(ef[key] || DEFAULT_EFFORTS[key] || '') }
+}
+
+// Стадия по метке задачи: research__x → research, method__agent → agent-doc.
+export function stageOfLabel(label) {
+  const [prefix, rest] = String(label).split('__')
+  if (prefix === 'method') return rest === 'agent' ? 'agent-doc' : 'method'
+  return prefix
+}
+
+// Аргументы Workflow-исполнителя для партии: модели и усилия считаются здесь, из engine.json,
+// потому что сам исполнитель файловой системы не видит. shortLabels — метки без префикса стадии.
+export function workflowArgs(raw, root, stage, shortLabels) {
+  const { syntheses } = normalizeEngine(raw)
+  const models = {}
+  const efforts = {}
+  if (stage === 'research' || stage === 'verify') {
+    for (const k of stage === 'research' ? ['research', 'verify'] : ['verify']) {
+      const r = routeFor(raw, k)
+      models[k] = r.model
+      efforts[k] = r.effort
+    }
+    return { root, ...(stage === 'verify' ? { stage: 'verify' } : {}), labels: shortLabels, models, efforts }
+  }
+  for (const l of shortLabels) {
+    const r = routeFor(raw, stage, syntheses.find(s => String(s.label) === l))
+    models[l] = r.model
+    efforts[l] = r.effort
+  }
+  return { root, stage, labels: shortLabels, models, efforts }
+}
+
 // ---------------------------------------------------------------- бриф
 
 // Бриф отвечает на вопрос «какую работу делает база» до того, как тема режется на ТЗ.

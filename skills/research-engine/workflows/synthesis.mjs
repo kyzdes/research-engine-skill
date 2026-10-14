@@ -1,7 +1,7 @@
 export const meta = {
   name: 'research-engine-synthesis',
   description: 'Стадии движка, где агент пишет один файл: разведка предмета для брифа, своды по отчётам, навигатор банка фактов, критик полноты, METHOD.md и AGENT.md — каждая партия агентов работает по своим файлам задач',
-  whenToUse: 'После того как отчёты собраны и верифицированы, а render-tasks.mjs отрендерил задачи нужной стадии. args: { root: "/abs/path/<slug>-engine", labels: ["field-spec", "verdicts"], stage?: "recon" | "synth" | "merge" | "critique" | "method" | "agent-doc", effort?: "high", model?: "<id>", schemas?: {} }. Стадия выбирает и вид задачи, и схему возврата. Партия — 3-4 задачи за вызов.',
+  whenToUse: 'После того как отчёты собраны и верифицированы, а render-tasks.mjs отрендерил задачи нужной стадии. args: { root: "/abs/path/<slug>-engine", labels: ["field-spec", "verdicts"], stage?: "recon" | "synth" | "merge" | "critique" | "method" | "agent-doc", models?: { "<label>": "opus" }, efforts?: { "<label>": "high" }, model?: "<id>", effort?: "high", schemas?: {} }. models и efforts — маршрут по задачам партии из engine.json (части банка фактов дешевле плейбуков), их печатают render-tasks.mjs и status.mjs. Стадия выбирает и вид задачи, и схему возврата. Партия — 3-4 задачи за вызов.',
   phases: [
     { title: 'Recon', detail: 'разведка предмета до второго круга вопросов заказчику: brief/RECON.md' },
     { title: 'Synthesize', detail: 'своды в synthesis/: каждый агент читает state/tasks/synth__<label>.md и полные отчёты' },
@@ -112,9 +112,16 @@ const CFG = has(STAGES, STAGE) ? STAGES[STAGE] : null
 if (!CFG) throw new Error('Неизвестная стадия: ' + STAGE + '. Ожидается одна из: ' + Object.keys(STAGES).join(', '))
 
 const SCHEMA = STAGE === 'critique' ? GAPS_SCHEMA : FILE_SCHEMA
-const EFFORT = A.effort || 'high'
-// Модель не задана — агент наследует модель сессии; это почти всегда правильно.
-const MODEL = A.model ? String(A.model) : ''
+// Маршрут по задачам: args.models / args.efforts по метке задачи (короткой или полной) из
+// engine.json; args.model / args.effort — одно значение на всю партию. Модели нет нигде —
+// агент наследует модель сессии.
+const pick = (o) => (o && typeof o === 'object' && !Array.isArray(o) ? o : {})
+const MODELS = pick(A.models)
+const EFFORTS = pick(A.efforts)
+const routeOf = (t) => ({
+  model: String(MODELS[t.short] || MODELS[t.label] || A.model || ''),
+  effort: String(EFFORTS[t.short] || EFFORTS[t.label] || A.effort || 'high'),
+})
 
 const raw = (Array.isArray(A.labels) ? A.labels : []).map(x => String(x).trim()).filter(Boolean)
 if (!raw.length) {
@@ -139,10 +146,13 @@ const LAW = 'Закон конвейера: ни один шаг не сжима
 const prompt = (label) => CFG.role + '\n\nФайл задачи: ' + taskFile(label) + '\n\nПорядок работы:\n1. Прочитай файл задачи целиком, от первой строки до последней. Он самодостаточен: миссия движка, периметр, список источников с путями, требуемые разделы, объём и формат возврата — всё там.\n2. Выполни его буквально, сверху вниз. Файл задачи — контракт, а не вдохновение: пропущенный пункт считается браком. Ничего не додумывай про предмет сверх того, что написано в задаче и в файлах, на которые она ссылается.\n3. ' + LAW + '\n4. Последним действием запиши результат в файл ' + resultFile(label) + ' (JSON, UTF-8) и верни тот же объект в ответе по схеме. Файл на диске обязателен: он читается независимо от того, каким хостом тебя запустили.'
 
 phase(CFG.phase)
-log('Стадия ' + STAGE + ' · задач в партии: ' + tasks.length + ' — ' + tasks.map(t => t.label).join(', '))
+log('Стадия ' + STAGE + ' · задач в партии: ' + tasks.length + ' — ' + tasks.map(t => t.label + ' (' + (routeOf(t).model || 'модель сессии') + ')').join(', '))
 if (tasks.length > 4) log('Внимание: партия больше четырёх задач. Прошлый прогон девяти тяжёлых агентов разом сжёг лимит сессии за пять минут; безопасная партия — 3-4 задачи.')
 
-const out = await parallel(tasks.map(t => () => agent(prompt(t.label), Object.assign({ label: t.label, phase: CFG.phase, schema: SCHEMA, effort: EFFORT }, MODEL ? { model: MODEL } : {}))))
+const out = await parallel(tasks.map(t => () => {
+  const r = routeOf(t)
+  return agent(prompt(t.label), Object.assign({ label: t.label, phase: CFG.phase, schema: SCHEMA, effort: r.effort }, r.model ? { model: r.model } : {}))
+}))
 
 const pairs = tasks.map((t, i) => ({ task: t, res: (out || [])[i] || null }))
 const done = pairs.filter(p => p.res)
@@ -182,7 +192,7 @@ const tail = CFG.next.replace(/ROOT/g, ROOT).replace(/^Дальше: /, '')
 return {
   stage: STAGE,
   root: ROOT,
-  model: MODEL || 'модель сессии',
+  models: Object.fromEntries(tasks.map(t => [t.short, routeOf(t).model || 'модель сессии'])),
   built,
   failed,
   // у разведки статусов нет: тем и сводов ещё не существует, status.mjs ей не нужен

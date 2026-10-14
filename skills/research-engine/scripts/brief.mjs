@@ -7,7 +7,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  die, isDir, isFile, readJson, normalizeEngine, briefFindings, acceptanceCoverage, renderBriefMd,
+  die, isDir, isFile, readJson, normalizeEngine, briefFindings, acceptanceCoverage, renderBriefMd, workflowArgs,
 } from './lib/engine.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -92,7 +92,7 @@ let next
 if (blockers.length) {
   next = 'закрой блокеры с заказчиком: вопросы о работе базы — references/BRIEF.md §3' +
     (recon ? '' : '; разведка предмета до второго круга вопросов: node ' + script('render-tasks.mjs') + ' --root ' + ROOT +
-      ' --stage recon и Workflow ' + path.join(ROOT, 'workflows', 'synthesis.mjs') + ' с args {"root":"' + ROOT + '","stage":"recon","labels":["field"]}') +
+      ' --stage recon и Workflow ' + path.join(ROOT, 'workflows', 'synthesis.mjs') + ' с args ' + JSON.stringify(workflowArgs(raw, ROOT, 'recon', ['field']))) +
     '; затем node ' + script('brief.mjs') + ' --root ' + ROOT + ' --write'
 } else if (!topics.length) {
   next = 'покажи BRIEF.md заказчику и дождись утверждения (точка останова), затем декомпозиция: каждая тема получает topics[].answers — id контрольных вопросов, ради которых она заведена'
