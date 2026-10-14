@@ -291,8 +291,17 @@ test('brief.mjs --write закрепляет id контрольных вопр�
   assert.match(fs.readFileSync(path.join(root, 'BRIEF.md'), 'utf8'), /\| A2 \| Вопрос два\? \|/)
 })
 
-test('synthesis.mjs: стадия recon — один разведчик, next ведёт к brief.mjs', async () => {
+test('synthesis.mjs: стадия recon — один разведчик, next ведёт к brief.mjs, без status.mjs', async () => {
   const { result, calls } = await runWorkflow('synthesis.mjs', { root: '/tmp/x-engine', stage: 'recon', labels: ['recon'] })
   assert.deepEqual(calls.map(c => c.label), ['recon__field'])
   assert.match(result.next, /brief\.mjs --root \/tmp\/x-engine --write/)
+  assert.doesNotMatch(result.next, /status\.mjs/)
+})
+
+test('разведка видит решённое с заказчиком и допущения брифа', () => {
+  const root = makeEngine({ brief: { ...FULL_BRIEF, constraints: ['база с нуля, не дельта'], assumptions: ['рынки US и RU — не подтверждено'] } })
+  assert.equal(run('render-tasks.mjs', ['--root', root, '--stage', 'recon']).code, 0)
+  const t = fs.readFileSync(path.join(root, 'state', 'tasks', 'recon__field.md'), 'utf8')
+  assert.match(t, /Уже решено с заказчиком[^\n]*\n- база с нуля, не дельта/)
+  assert.match(t, /- рынки US и RU — не подтверждено/)
 })

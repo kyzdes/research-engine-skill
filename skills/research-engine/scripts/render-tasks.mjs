@@ -192,7 +192,14 @@ const COMMON = {
   ALL_REPORTS,
   ALL_SYNTHESIS,
   // бриф (references/BRIEF.md): работа базы, контрольные вопросы, материалы заказчика, политика источников
-  REQUEST: [brief.request ? 'Дословно: «' + brief.request + '»' : '', brief.restated ? 'Как его поняли: ' + brief.restated : ''].filter(Boolean).join('\n\n'),
+  // Разведка идёт параллельно разговору с заказчиком: всё, что уже решено, обязано до неё доехать,
+  // иначе она заново предлагает выбор, который заказчик уже сделал.
+  REQUEST: [
+    brief.request ? 'Дословно: «' + brief.request + '»' : '',
+    brief.restated ? 'Как его поняли: ' + brief.restated : '',
+    brief.constraints.length ? '**Уже решено с заказчиком — не предлагай заново:**\n' + brief.constraints.map(x => '- ' + x).join('\n') : '',
+    brief.assumptions.length ? '**Допущения** (неподтверждённые помечены — их можно проверить и оспорить):\n' + brief.assumptions.map(x => '- ' + x).join('\n') : '',
+  ].filter(Boolean).join('\n\n'),
   JOBS: jobsText(brief),
   ACCEPTANCE_LIST: acceptanceText(brief.acceptance, 'контрольные вопросы в брифе не заданы — готовность базы мерить нечем, отметь это как риск'),
   INPUTS_LIST: inputsText(brief, ROOT),

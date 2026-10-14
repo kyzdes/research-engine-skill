@@ -185,7 +185,8 @@ return {
   model: MODEL || 'модель сессии',
   built,
   failed,
+  // у разведки статусов нет: тем и сводов ещё не существует, status.mjs ей не нужен
   next: failed.length
-    ? 'Сначала перезапусти упавшие задачи: synthesis.mjs со stage ' + STAGE + ' и args.labels ' + JSON.stringify(failed.map(l => l.replace(/^[a-z]+__/, ''))) + '. Потом — ' + status + ' Дальше: ' + tail
-    : 'Сначала ' + status + ' Дальше: ' + tail,
+    ? 'Сначала перезапусти упавшие задачи: synthesis.mjs со stage ' + STAGE + ' и args.labels ' + JSON.stringify(failed.map(l => l.replace(/^[a-z]+__/, ''))) + '. Потом — ' + (STAGE === 'recon' ? '' : status + ' Дальше: ') + tail
+    : (STAGE === 'recon' ? 'Дальше: ' : 'Сначала ' + status + ' Дальше: ') + tail,
 }
