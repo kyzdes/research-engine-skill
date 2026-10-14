@@ -164,14 +164,30 @@ const hasUrl = (s) => /https?:\/\//i.test(s) || /\]\([^)\s]+\)/.test(s)
 
 // ---------------------------------------------------------------- проверки текста
 
+// Маркер-слово ищется целым словом: «опущено» не должно срабатывать внутри «не пропущено».
+const escapeRe = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const MARKER_RES = MARKERS.map(mk => ({
+  mk,
+  re: new RegExp((/^[\p{L}]/u.test(mk) ? '(?<![\\p{L}])' : '') + escapeRe(mk) + (/[\p{L}]$/u.test(mk) ? '(?![\\p{L}])' : ''), 'u'),
+}))
+
+const stripQuotesAndUrls = (line) => line
+  .replace(/https?:\/\/\S+/g, ' ')
+  .replace(/\d\s?(…|\.\.\.)\s?\d/g, ' ') // числовой диапазон 2025-01-05…2025-01-11
+  .replace(/«[^«»]*»/g, ' ')
+  .replace(/“[^“”]*”/g, ' ')
+  .replace(/"[^"]*"/g, ' ')
+
 function checkCompression(section, file, text, cap = 8) {
   const lines = text.split('\n')
   const mask = codeFenceMask(lines)
   let hits = 0
   for (let i = 0; i < lines.length; i++) {
     if (mask[i]) continue
-    const low = lines[i].toLowerCase()
-    const found = MARKERS.filter(mk => low.includes(mk))
+    // Пропуск внутри дословной цитаты («… can influence …»), в URL и в inline-коде — законная
+    // форма цитирования, а не сжатие: живой прогон дал 11 таких ложных находок на 4 отчёта.
+    const low = stripQuotesAndUrls(maskInlineCode(lines[i])).toLowerCase()
+    const found = MARKER_RES.filter(m => m.re.test(low)).map(m => m.mk)
     if (!found.length) continue
     hits++
     if (hits <= cap) {

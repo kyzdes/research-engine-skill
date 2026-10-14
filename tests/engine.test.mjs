@@ -352,3 +352,30 @@ test('исполнители раздают модели по ролям и за
   assert.deepEqual(s.calls.map(c => [c.label, c.model]), [['synth__field-spec', 'opus'], ['synth__facts-bank-a', 'sonnet']])
   assert.deepEqual(s.result.models, { 'field-spec': 'opus', 'facts-bank-a': 'sonnet' })
 })
+
+test('audit: многоточие в дословной цитате, URL и коде — не след сжатия; «и т.д.» в тексте — след', () => {
+  const root = makeEngine()
+  fs.writeFileSync(path.join(root, 'reports', '01-alpha.md'), [
+    '# 01', '',
+    'Apple пишет: «Ratings and reviews … can influence how your app ranks».',
+    'Адрес: https://example.com/api/v2/... и код `a...b`.',
+    'Поля: name, subtitle и т.д.', '',
+  ].join('\n'))
+  const audit = JSON.parse(run('audit.mjs', ['--root', root, '--stage', 'research', '--json']).out)
+  const comp = audit.findings.filter(f => f.code === 'compression' && f.file.endsWith('01-alpha.md'))
+  assert.equal(comp.length, 1, JSON.stringify(comp))
+  assert.match(comp[0].message, /и т\.д\./)
+})
+
+test('audit: маркер сжатия ищется целым словом, числовой диапазон с многоточием — не сжатие', () => {
+  const root = makeEngine()
+  fs.writeFileSync(path.join(root, 'reports', '01-alpha.md'), [
+    '# 01', '',
+    'Что в таблице не пропущено намеренно: платные инструменты вынесены отдельно.',
+    'Неделя 2025-01-05…2025-01-11 и диапазон 3...5 дней.',
+    'Детали опущено.', '',
+  ].join('\n'))
+  const audit = JSON.parse(run('audit.mjs', ['--root', root, '--stage', 'research', '--json']).out)
+  const comp = audit.findings.filter(f => f.code === 'compression' && f.file.endsWith('01-alpha.md'))
+  assert.deepEqual(comp.map(f => f.line), [5])
+})
