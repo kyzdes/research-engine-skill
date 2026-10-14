@@ -4,9 +4,13 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   die, isDir, isFile, readText, readJson, countWords, fmt, plural, codeFenceMask, synthFileName, todayISO,
+  resolveRoot, takeValue, shq, normalizeEngine, bankLayout, isGaps, isBankNav,
 } from './lib/engine.mjs'
+
+const SELF = fileURLToPath(import.meta.url)
 
 const USAGE = `build-index.mjs — карта сводов: когда открывать, сколько строк и слов, «строка | раздел».
 
@@ -28,13 +32,13 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--help' || a === '-h') { console.log(USAGE); process.exit(0) }
-    else if (a === '--root') out.root = argv[++i] || ''
+    else if (a === '--root') out.root = takeValue(argv, i++, a)
     else if (a.startsWith('--root=')) out.root = a.slice('--root='.length)
-    else if (a === '--dir') out.dir = argv[++i] || ''
+    else if (a === '--dir') out.dir = takeValue(argv, i++, a)
     else if (a.startsWith('--dir=')) out.dir = a.slice('--dir='.length)
-    else if (a === '--out') out.out = argv[++i] || ''
+    else if (a === '--out') out.out = takeValue(argv, i++, a)
     else if (a.startsWith('--out=')) out.out = a.slice('--out='.length)
-    else if (a === '--max-depth') out.maxDepth = Number(argv[++i])
+    else if (a === '--max-depth') out.maxDepth = Number(takeValue(argv, i++, a))
     else if (a.startsWith('--max-depth=')) out.maxDepth = Number(a.slice('--max-depth='.length))
     else die('неизвестный аргумент ' + a + '\n\n' + USAGE)
   }
@@ -44,7 +48,7 @@ function parseArgs(argv) {
   if (!Number.isInteger(out.maxDepth) || out.maxDepth < 2 || out.maxDepth > 6) {
     die('--max-depth принимает целое от 2 до 6')
   }
-  out.root = path.resolve(out.root)
+  out.root = resolveRoot(out.root)
   if (!isDir(out.root)) die('каталог движка не найден: ' + out.root)
   return out
 }
@@ -92,13 +96,15 @@ const escapeCell = (s) => s.replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim()
 const linesRu = (n) => fmt(n) + ' ' + plural(n, 'строка', 'строки', 'строк')
 const wordsRu = (n) => fmt(n) + ' ' + plural(n, 'слово', 'слова', 'слов')
 
-// Файлы с известной ролью: подпись «когда открывать» ставится по роли, а не по названию свода.
-function knownWhen(name) {
+// Файлы с известной ролью: подпись «когда открывать» ставится по роли записи в engine.json
+// (GAPS, навигатор и части банка), а не по названию файла.
+function knownWhen(name, meta) {
   if (name === 'METHOD.md') return 'Всегда, целиком, до первого действия.'
   if (name === 'AGENT.md') return 'Первый файл сессии: как работать по движку.'
-  if (name === 'GAPS.md') return 'Прежде чем что-то пообещать заказчику: чего движок не знает и где навредит.'
-  if (name === 'FACTS-BANK.md') return 'Навигатор банка: ищешь, в какой части лежит число.'
-  if (/^FACTS-BANK-[a-z]\.md$/i.test(name)) return 'Ищешь число, а не процедуру — grep по части банка, чтения подряд не бывает.'
+  if ((meta && isGaps(meta)) || name === 'GAPS.md') return 'Прежде чем что-то пообещать заказчику: чего движок не знает и где навредит.'
+  if (meta && bankParts.some(p => p.label === meta.label)) return 'Ищешь число, а не процедуру — grep по части банка, чтения подряд не бывает.'
+  if ((meta && isBankNav(meta)) || name === 'FACTS-BANK.md') return 'Навигатор банка: ищешь, в какой части лежит число.'
+  if (/^FACTS-BANK-.+\.md$/i.test(name)) return 'Ищешь число, а не процедуру — grep по части банка, чтения подряд не бывает.'
   if (name === 'VERDICTS.md') return 'Спор между источниками: чья позиция чем подтверждена.'
   return ''
 }
@@ -117,7 +123,8 @@ if (!engine.title && !engine.slug) {
   console.error('Предупреждение: engine.json не прочитан — порядок файлов будет алфавитный, названия сводов взяты из файлов.')
 }
 
-const syntheses = Array.isArray(engine.syntheses) ? engine.syntheses.filter(Boolean) : []
+const { syntheses } = normalizeEngine(engine)
+const { parts: bankParts } = bankLayout(syntheses)
 
 // порядок: как в engine.json, остальное — в конец по алфавиту
 const present = fs.readdirSync(DIR).filter(f => f.endsWith('.md')).sort()
@@ -169,7 +176,7 @@ for (const e of entries) {
   }
 
   const when = (e.meta && (e.meta.when || e.meta.whenToOpen))
-    || knownWhen(e.name)
+    || knownWhen(e.name, e.meta)
     || (e.meta && e.meta.title ? 'Работаешь с темой: ' + e.meta.title + '.' : 'Точечно, по адресу из таблицы ниже.')
 
   const what = firstSentence(info.intro) ||
@@ -243,7 +250,7 @@ const foot = []
 foot.push('')
 foot.push('---')
 foot.push('')
-foot.push('*Номера строк сняты ' + today + '. После правки любого свода перегенерируй карту: `node scripts/build-index.mjs --root ' + ROOT + '`.*')
+foot.push('*Номера строк сняты ' + today + '. После правки любого свода перегенерируй карту: `node ' + shq(SELF) + ' --root ' + shq(ROOT) + '`.*')
 foot.push('')
 
 const outText = head.join('\n') + blocks.join('\n\n') + '\n' + foot.join('\n')

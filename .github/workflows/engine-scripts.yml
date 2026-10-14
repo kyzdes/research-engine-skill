@@ -8,8 +8,16 @@ permissions:
 jobs:
   engine:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Скрипты обещают Node 18+: нижняя граница проверяется, а не предполагается.
+        node: [18, 20, 22]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      # Node на раннере уже стоит; скрипты движка без зависимостей, ставить нечего.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+      # Скрипты движка без зависимостей, ставить нечего.
       - run: node --version
       - run: node --test tests/engine.test.mjs

@@ -7,11 +7,12 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  die, isDir, isFile, readJson, normalizeEngine, briefFindings, acceptanceCoverage, renderBriefMd,
+  die, isDir, isFile, readJson, normalizeEngine, briefFindings, acceptanceCoverage, renderBriefMd, workflowArgs,
+  flushAndExit, resolveRoot, takeValue, shq, pinAcceptanceIds, writeEngineJson,
 } from './lib/engine.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
-const script = (name) => path.join(HERE, name)
+const script = (name) => shq(path.join(HERE, name))
 
 const USAGE = `brief.mjs — готов ли бриф движка и на какие контрольные вопросы уже назначены темы.
 
@@ -33,23 +34,24 @@ function parseArgs(argv) {
     if (a === '--help' || a === '-h') { console.log(USAGE); process.exit(0) }
     else if (a === '--write') out.write = true
     else if (a === '--json') out.json = true
-    else if (a === '--root') out.root = argv[++i] || ''
+    else if (a === '--root') out.root = takeValue(argv, i++, a)
     else if (a.startsWith('--root=')) out.root = a.slice('--root='.length)
     else die('неизвестный аргумент ' + a + '\n\n' + USAGE)
   }
   if (!out.root) die('не задан --root <path>\n\n' + USAGE)
-  out.root = path.resolve(out.root)
+  out.root = resolveRoot(out.root)
   if (!isDir(out.root)) die('каталог движка не найден: ' + out.root)
   return out
 }
 
 const args = parseArgs(process.argv.slice(2))
 const ROOT = args.root
+const R = shq(ROOT)
 const enginePath = path.join(ROOT, 'engine.json')
 const raw = readJson(enginePath)
 if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
   die(isFile(enginePath) ? 'engine.json не читается как JSON-объект: ' + enginePath
-    : 'нет engine.json в ' + ROOT + ' — заведи движок: node ' + script('engine-init.mjs') + ' --root ' + ROOT + ' --slug <slug> --request "<запрос>"')
+    : 'нет engine.json в ' + ROOT + ' — заведи движок: node ' + script('engine-init.mjs') + ' --root ' + R + ' --slug <slug> --request "<запрос>"')
 }
 
 const { topics } = normalizeEngine(raw)
@@ -64,16 +66,14 @@ if (topics.length) {
 
 const written = []
 if (args.write) {
-  // id, выданные по порядку, закрепляются в engine.json: ссылки topics[].answers не должны съехать
+  // id, выданные по порядку, закрепляются в engine.json: ссылки topics[].answers не должны съехать.
+  // Остальные поля вопроса (priority, source…) сохраняются.
   if (brief.acceptance.some(a => a.autoId) && raw.brief && Array.isArray(raw.brief.acceptance)) {
-    raw.brief.acceptance = brief.acceptance.map(({ id, question, job }) => ({ id, question, job }))
-    const tmp = enginePath + '.tmp-' + process.pid
+    raw.brief.acceptance = pinAcceptanceIds(raw.brief.acceptance, brief.acceptance)
     try {
-      fs.writeFileSync(tmp, JSON.stringify(raw, null, 2) + '\n', 'utf8')
-      fs.renameSync(tmp, enginePath)
+      writeEngineJson(ROOT, raw)
       written.push('engine.json (id контрольных вопросов закреплены)')
     } catch (e) {
-      try { fs.rmSync(tmp, { force: true }) } catch { /* нечего убирать */ }
       die('не удалось записать ' + enginePath + ': ' + e.message, 1)
     }
   }
@@ -90,16 +90,19 @@ if (args.write) {
 const recon = isFile(path.join(ROOT, 'brief', 'RECON.md'))
 let next
 if (blockers.length) {
-  next = 'закрой блокеры с заказчиком: вопросы о работе базы — references/BRIEF.md §3' +
-    (recon ? '' : '; разведка предмета до второго круга вопросов: node ' + script('render-tasks.mjs') + ' --root ' + ROOT +
-      ' --stage recon и Workflow ' + path.join(ROOT, 'workflows', 'synthesis.mjs') + ' с args {"root":"' + ROOT + '","stage":"recon","labels":["field"]}') +
-    '; затем node ' + script('brief.mjs') + ' --root ' + ROOT + ' --write'
+  // разведке нужен исходный запрос: без него render-tasks --stage recon падает
+  const reconHint = recon ? ''
+    : !(brief.request || brief.restated) ? '; для разведки предмета сначала впиши исходный запрос в brief.request'
+    : '; разведка предмета до второго круга вопросов: node ' + script('render-tasks.mjs') + ' --root ' + R +
+      ' --stage recon и Workflow ' + path.join(ROOT, 'workflows', 'synthesis.mjs') + ' с args ' + JSON.stringify(workflowArgs(raw, ROOT, 'recon', ['field']))
+  next = 'закрой блокеры с заказчиком: вопросы о работе базы — references/BRIEF.md §3' + reconHint +
+    '; затем node ' + script('brief.mjs') + ' --root ' + R + ' --write'
 } else if (!topics.length) {
   next = 'покажи BRIEF.md заказчику и дождись утверждения (точка останова), затем декомпозиция: каждая тема получает topics[].answers — id контрольных вопросов, ради которых она заведена'
 } else if (cov.uncovered.length) {
   next = 'декомпозиция не закрывает контрольные вопросы ' + cov.uncovered.join(', ') + ' — допиши темы или их answers до прогона ресерча'
 } else {
-  next = 'бриф и карта тем согласованы: node ' + script('render-tasks.mjs') + ' --root ' + ROOT + ' --stage research'
+  next = 'бриф и карта тем согласованы: node ' + script('render-tasks.mjs') + ' --root ' + R + ' --stage research'
 }
 
 // ---------------------------------------------------------------- вывод
@@ -110,7 +113,7 @@ if (args.json) {
     acceptance: brief.acceptance.map(a => ({ id: a.id, question: a.question, job: a.job, topics: cov.map[a.id] })),
     recon, written, next,
   }, null, 2))
-  process.exit(blockers.length ? 1 : 0)
+  await flushAndExit(blockers.length ? 1 : 0)
 }
 
 console.log('# Бриф движка «' + (raw.title || raw.slug || path.basename(ROOT)) + '»')
@@ -143,4 +146,4 @@ if (written.length) {
 }
 console.log('')
 console.log('Дальше — ' + next)
-process.exit(blockers.length ? 1 : 0)
+await flushAndExit(blockers.length ? 1 : 0)

@@ -5,31 +5,51 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   die, isDir, isFile, readText, readJson, countWords, fmt, plural, wordsRu,
-  codeFenceMask, maskInlineCode, headings, findVerificationHeading,
+  codeFenceMask, maskInlineCode, headings, verificationOf,
   normalizeEngine, synthFileName, isGaps, isBankNav, bankLayout, DEFAULT_FINISH,
-  normalizeBrief, acceptanceCoverage,
+  normalizeBrief, acceptanceCoverage, flushAndExit, resolveRoot, takeValue, matrixFindings,
+  gapsRelPath, schemaProblems, agentResult,
 } from './lib/engine.mjs'
+
+const SKILL = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
 const USAGE = `audit.mjs — проверка закона конвейера: ни один шаг не сжимает содержание.
 
-  node audit.mjs --root <path> [--stage all|prompts|research|synthesis] [--json]
+  node audit.mjs --root <path> [--stage all|prompts|research|synthesis] [--json] [--all]
 
   --root    каталог движка (в нём лежит engine.json). Обязателен.
   --stage   что проверять: all (по умолчанию) | prompts | research | synthesis
   --json    машинный вывод вместо читаемого отчёта
+  --all     все находки по следам сжатия и числам без источника, без лимита 8 на файл
   --help    эта справка
 
 Блокеры (код возврата 1):
-  нет отчёта на прогнанную тему · в отчёте нет раздела «## Верификация» ·
-  отчёт после верификации не вырос · свод короче четверти суммарного объёма своих
-  primary-отчётов · нет файла свода, помеченного done · битая внутренняя ссылка.
+  no-engine-json       нет engine.json или он не читается
+  no-report            тема прогонялась (статус, результат агента), а отчёта нет или он пуст
+  no-verification      верификация числится (статус verified, результат verify__), а раздела
+                       «## Верификация», подписанного верификатором, в отчёте нет
+  no-growth            отчёт после верификации не вырос (wordsAfter ≤ wordsBefore)
+  synthesis-too-short  свод короче четверти суммарного объёма своих primary-отчётов
+  no-synthesis-file    свод (или GAPS.md) помечен done, а файла нет или он пуст
+  broken-link          битая внутренняя ссылка в markdown
 
 Предупреждения (код возврата 0):
-  следы сжатия («и т.д.», «см. выше», «аналогично», «и другие», «…») · вопрос ТЗ без
-  ответа в отчёте · число без даты и URL рядом · тема, не питающая ни один свод ·
-  свод без primary-темы · недостающие файлы финиша.`
+  бриф и карта тем     no-brief, no-acceptance, acceptance-uncovered, acceptance-unknown,
+                       matrix (расхождения feeds/primary, метки, дубли файлов),
+                       topic-feeds-nothing, synthesis-without-primary, no-synthesis-spec,
+                       no-prompts-readme, no-prompt, thin-prompt, no-questions-section,
+                       no-topics, no-syntheses
+  отчёты               report-planned, verification-pending, no-words-numbers, words-drift,
+                       question-uncovered (эвристика по опорным словам)
+  текст                compression[-more] («и т.д.», «см. выше», «аналогично», «…» вне цитат,
+                       URL и кода), number-without-source[-more] (число без даты или URL
+                       в окне ±3 строки; реквизиты, расчёты и строки банка с источником
+                       не в счёт)
+  своды и финиш        synthesis-planned, primary-report-missing, finish-file-missing
+  результаты агентов   result-schema (state/results/<label>.json не по схеме стадии)`
 
 const SECTIONS = ['Каркас', 'ТЗ и карта тем', 'Отчёты', 'Своды', 'Ссылки']
 
@@ -55,22 +75,23 @@ const MONTHS = /(январ|феврал|март|апрел|ма[йя]|июн|�
 // ---------------------------------------------------------------- аргументы
 
 function parseArgs(argv) {
-  const out = { root: '', stage: 'all', json: false }
+  const out = { root: '', stage: 'all', json: false, all: false }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--help' || a === '-h') { console.log(USAGE); process.exit(0) }
-    else if (a === '--root') out.root = argv[++i] || ''
+    else if (a === '--root') out.root = takeValue(argv, i++, a)
     else if (a.startsWith('--root=')) out.root = a.slice('--root='.length)
-    else if (a === '--stage') out.stage = argv[++i] || ''
+    else if (a === '--stage') out.stage = takeValue(argv, i++, a)
     else if (a.startsWith('--stage=')) out.stage = a.slice('--stage='.length)
     else if (a === '--json') out.json = true
+    else if (a === '--all') out.all = true
     else die('неизвестный аргумент ' + a + '\n\n' + USAGE)
   }
   if (!out.root) die('не задан --root <path>\n\n' + USAGE)
   if (!['all', 'prompts', 'research', 'synthesis'].includes(out.stage)) {
     die('--stage принимает all | prompts | research | synthesis, получено: ' + out.stage)
   }
-  out.root = path.resolve(out.root)
+  out.root = resolveRoot(out.root)
   if (!isDir(out.root)) die('каталог движка не найден: ' + out.root)
   return out
 }
@@ -146,11 +167,29 @@ function keywordsOf(text) {
   return out
 }
 
+// Не факты, а реквизиты: даты, идентификаторы препринтов, версии ПО, номера разделов, URL.
+// Живой прогон показал, что именно они давали большую часть находок number-without-source:
+// дата «14.10.2026» читалась как десятичное 14.10, arXiv 2602.23234 — как число.
+const NON_FACTS = [
+  /https?:\/\/\S+/g,
+  /\]\([^)\s]+\)/g,
+  /\b\d{4}-\d{2}-\d{2}(?:[–-]\d{2})?\b/g,
+  /\b\d{1,2}(?:[–-]\d{1,2})?\.\d{1,2}\.\d{2,4}\b/g,
+  /\b(?:arxiv[:\s]*)?\d{4}\.\d{4,5}(?:v\d+)?\b/gi,
+  /\b(?:ios|ipados|macos|watchos|visionos|sdk|xcode|swift|api|v)\s?\d+(?:\.\d+)*\b/gi,
+  /(?:§|раздел\p{L}*\s|разд\.\s?|п\.\s?|пункт\p{L}*\s|guideline\s|guidelines\s)\d+(?:\.\d+)*(?:\.[a-z])?/giu,
+  /`[^`]*`/g,
+  /\b\d+\.\d+\.\d+(?:\.\d+)*(?:\([a-z]\))?/g, // номер пункта правил или версии: 2.3.1(a), 5.6.3
+]
+
+const stripNonFacts = (line) => NON_FACTS.reduce((s, re) => s.replace(re, ' '), line)
+
 function significantNumbers(line) {
   const out = []
   const re = /\d+(?:[.,]\d+)?\s?%|\d+[.,]\d+|\d{3,}/g
+  const clean = stripNonFacts(line)
   let m
-  while ((m = re.exec(line))) {
+  while ((m = re.exec(clean))) {
     const s = m[0]
     if (/^\d{4}$/.test(s) && Number(s) >= 1900 && Number(s) <= 2100) continue
     out.push(s)
@@ -160,18 +199,37 @@ function significantNumbers(line) {
 
 const hasDate = (s) =>
   /\b(19|20)\d{2}\b/.test(s) || /\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/.test(s) || MONTHS.test(s)
-const hasUrl = (s) => /https?:\/\//i.test(s) || /\]\([^)\s]+\)/.test(s)
+// URL — со схемой, markdown-ссылка или голый домен с путём (domain.com/path): так источники
+// часто пишут в списках «· Apple · 14.10.2026 · performance-partners.apple.com/search-api».
+const BARE_URL = /\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|org|net|io|dev|app|ai|ru|co|edu|gov|eu|me|info|tech|uk|de|fr)\b(?:\/[^\s|)]*)?/i
+const hasUrl = (s) => /https?:\/\//i.test(s) || /\]\([^)\s]+\)/.test(s) || BARE_URL.test(s)
 
 // ---------------------------------------------------------------- проверки текста
 
-function checkCompression(section, file, text, cap = 8) {
+// Маркер-слово ищется целым словом: «опущено» не должно срабатывать внутри «не пропущено».
+const escapeRe = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const MARKER_RES = MARKERS.map(mk => ({
+  mk,
+  re: new RegExp((/^[\p{L}]/u.test(mk) ? '(?<![\\p{L}])' : '') + escapeRe(mk) + (/[\p{L}]$/u.test(mk) ? '(?![\\p{L}])' : ''), 'u'),
+}))
+
+const stripQuotesAndUrls = (line) => line
+  .replace(/https?:\/\/\S+/g, ' ')
+  .replace(/\d\s?(…|\.\.\.)\s?\d/g, ' ') // числовой диапазон 2025-01-05…2025-01-11
+  .replace(/«[^«»]*»/g, ' ')
+  .replace(/“[^“”]*”/g, ' ')
+  .replace(/"[^"]*"/g, ' ')
+
+function checkCompression(section, file, text, cap = args.all ? Infinity : 8) {
   const lines = text.split('\n')
   const mask = codeFenceMask(lines)
   let hits = 0
   for (let i = 0; i < lines.length; i++) {
     if (mask[i]) continue
-    const low = lines[i].toLowerCase()
-    const found = MARKERS.filter(mk => low.includes(mk))
+    // Пропуск внутри дословной цитаты («… can influence …»), в URL и в inline-коде — законная
+    // форма цитирования, а не сжатие: живой прогон дал 11 таких ложных находок на 4 отчёта.
+    const low = stripQuotesAndUrls(maskInlineCode(lines[i])).toLowerCase()
+    const found = MARKER_RES.filter(m => m.re.test(low)).map(m => m.mk)
     if (!found.length) continue
     hits++
     if (hits <= cap) {
@@ -186,18 +244,58 @@ function checkCompression(section, file, text, cap = 8) {
   return hits
 }
 
-function checkNumbers(section, file, text, cap = 8) {
+// Ячейки строки markdown-таблицы (без крайних пустых).
+const tableCells = (line) => line.trim().replace(/^\||\|$/g, '').split(/(?<!\\)\|/).map(c => c.trim())
+const SOURCE_COL = /источник|url|ссылк|source|носитель|первоисточник/i
+const DATE_COL = /дата|date|проверен|снят/i
+const EMPTY_CELL = /^(|—|-|–|н\/д|n\/a|нет)$/i
+// Ссылка на список источников отчёта: [12], [S3], [F64], [A-ext].
+const SOURCE_REF = /\[(?:\d{1,3}|[A-ZА-Я][A-Za-zА-Яа-я-]{0,6}\d{0,4})\]/
+
+// Для каждой строки таблицы — ячейки её заголовка: по ним видно, есть ли в таблице
+// колонка источника и колонка даты.
+function tableHeaders(lines, mask) {
+  const out = new Array(lines.length).fill(null)
+  for (let i = 0; i < lines.length; i++) {
+    if (mask[i] || !/^\s*\|/.test(lines[i])) continue
+    const head = tableCells(lines[i])
+    let j = i + 1
+    while (j < lines.length && !mask[j] && /^\s*\|/.test(lines[j])) { out[j] = head; j++ }
+    i = j - 1
+  }
+  return out
+}
+
+// Строка таблицы с заполненной колонкой источника и датой (в строке, в колонке даты
+// или рядом) — с источником: так устроен банк фактов, URL стоит в своей ячейке или
+// источник назван по имени, а полный адрес лежит в списке источников отчёта.
+function tableRowSourced(line, head, win) {
+  if (!head) return false
+  const cells = tableCells(line)
+  const srcIdx = head.findIndex(h => SOURCE_COL.test(h))
+  if (srcIdx < 0 || EMPTY_CELL.test(cells[srcIdx] || '')) return false
+  const dateIdx = head.findIndex(h => DATE_COL.test(h))
+  return hasDate(line) || (dateIdx >= 0 && !EMPTY_CELL.test(cells[dateIdx] || '')) || hasDate(win)
+}
+
+function checkNumbers(section, file, text, cap = args.all ? Infinity : 8) {
   const lines = text.split('\n')
   const mask = codeFenceMask(lines)
+  const heads = tableHeaders(lines, mask)
   let hits = 0
   for (let i = 0; i < lines.length; i++) {
     if (mask[i]) continue
     const line = lines[i]
     if (/^\s*#{1,6}\s/.test(line)) continue
-    if (/^\s*\|?\s*-{3,}/.test(line)) continue
+    if (/^\s*\|?\s*:?-{3,}/.test(line)) continue
     if (!significantNumbers(line).length) continue
+    // Строка расчёта (LTV = $9,99 × 0,85 × 2,22 = $18,87) — вычисление из уже обвязанных
+    // входов, а не новый факт: источник у входов, а не у результата.
+    if (/=/.test(line) && /[×*÷]|\s[-+\/]\s/.test(line)) continue
     const win = lines.slice(Math.max(0, i - 3), Math.min(lines.length, i + 4)).join('\n')
     if (hasDate(win) && hasUrl(win)) continue
+    if (tableRowSourced(line, heads[i], win)) continue
+    if (SOURCE_REF.test(stripNonFacts(line)) && hasDate(win)) continue
     hits++
     if (hits <= cap) {
       const miss = [!hasDate(win) ? 'даты' : null, !hasUrl(win) ? 'URL' : null].filter(Boolean).join(' и ')
@@ -245,7 +343,9 @@ function checkLinks(section, file, text) {
     let m
     while ((m = re.exec(line))) {
       let target = m[1]
-      if (/^(https?:|mailto:|tel:|data:|#)/i.test(target)) continue
+      // внешняя ссылка с любой схемой (http, ftp, doi:, file:) или протокол-относительная — не наша забота
+      // точки в схеме нет: «SPEC.md:120» — ссылка на файл с номером строки, а не URL
+      if (/^([a-z][a-z0-9+-]*:|\/\/|#)/i.test(target)) continue
       target = target.split('#')[0]
       if (!target) continue
       try { target = decodeURIComponent(target) } catch { /* оставляем как есть */ }
@@ -278,14 +378,11 @@ function deepNumber(obj, key, depth = 0) {
   return null
 }
 
+// Результат верификатора — тот же, что засчитывает status (lib/engine.mjs → agentResult):
+// сырой возврат упавшего прогона результатом не считается.
 function verifyResult(root, slug) {
-  const dir = path.join(root, 'state', 'results')
-  for (const name of ['verify__' + slug + '.json', 'verify__' + slug + '.raw.json']) {
-    const p = path.join(dir, name)
-    const data = readJson(p)
-    if (data) return { path: p, data }
-  }
-  return null
+  const r = agentResult(root, 'verify__' + slug)
+  return r && r.data ? r : null
 }
 
 // ---------------------------------------------------------------- основной прогон
@@ -305,7 +402,7 @@ if (!engine) {
     isFile(enginePath)
       ? 'engine.json не читается как JSON — почини файл, без него аудита нет'
       : 'нет файла engine.json — движок не собран или указан не тот --root')
-  output()
+  await output()
 }
 
 const { topics, syntheses } = normalizeEngine(engine)
@@ -314,7 +411,6 @@ const { entry: bankEntry, parts: bankParts } = bankLayout(syntheses)
 // стадия merge. У них нет тем в primary и нет ТЗ в synthesis-spec; мерить их порогом
 // «четверть от primary-отчётов» и требовать от них primary — ложные находки.
 const isSpecial = (s) => isGaps(s) || (bankParts.length > 0 && s === bankEntry)
-const runLog = readText(path.join(ROOT, 'state', 'run-log.md')) || ''
 
 note('Каркас', 'движок: ' + (engine.title || engine.slug || '(без названия)') +
   ' · профиль ' + (engine.profile || '?') + ' · финиш ' + (engine.finish || '?') +
@@ -349,6 +445,8 @@ if (doPrompts) {
       warn('ТЗ и карта тем', enginePath, 0, 'acceptance-unknown', 'тема ' + u.topic + ' ссылается на контрольный вопрос ' + u.id + ', которого нет в брифе')
     }
   }
+
+  for (const m of matrixFindings({ topics, syntheses })) warn('ТЗ и карта тем', enginePath, 0, 'matrix', m)
 
   for (const t of topics) {
     const feedsFromTopic = Array.isArray(t.feeds) ? t.feeds : []
@@ -399,18 +497,18 @@ if (doResearch || doSynth) {
     const p = path.join(ROOT, 'reports', slug + '.md')
     const text = readText(p)
     const status = String(t.status || 'planned')
-    const resDir = path.join(ROOT, 'state', 'results')
+    // Прогон числится по статусу и по результатам агентов на диске, а не по журналу: в журнал
+    // попадают и упавшие задачи, и метка pricing находилась внутри pricing-b2b.
     const ranResearch = status !== 'planned' ||
-      isFile(path.join(resDir, 'research__' + slug + '.json')) ||
-      isFile(path.join(resDir, 'research__' + slug + '.raw.json')) ||
-      !!verifyResult(ROOT, slug) ||
-      runLog.includes('research__' + slug) || runLog.includes('verify__' + slug)
-    if (text == null) {
+      !!agentResult(ROOT, 'research__' + slug) ||
+      !!verifyResult(ROOT, slug)
+    // пустой файл — тот же потерянный отчёт: агент открыл файл и оборвался
+    if (text == null || !countWords(text)) {
       if (!ranResearch) {
         if (doResearch) warn('Отчёты', p, 0, 'report-planned', 'нет файла отчёта, тема в статусе planned — просто ещё не прогнана')
       } else {
         blocker('Отчёты', p, 0, 'no-report',
-          'нет отчёта на тему ' + slug + ', хотя ресерч по ней числится (статус темы «' + status + '») — файл потерян или записан не туда')
+          (text == null ? 'нет отчёта' : 'отчёт пуст') + ' на тему ' + slug + ', хотя ресерч по ней числится (статус темы «' + status + '») — файл потерян, оборван или записан не туда')
       }
       continue
     }
@@ -418,20 +516,20 @@ if (doResearch || doSynth) {
     reportWords.set(slug, words)
     if (!doResearch) continue
 
-    // заголовок ищем по смыслу: живой прогон показал, что агент пишет и «## 8. Протокол верификации от <дата>»
-    const verifyHead = findVerificationHeading(text)
+    // заголовок ищем по смыслу: живой прогон показал, что агент пишет и «## 8. Протокол верификации от <дата>»;
+    // засчитывается только раздел, подписанный верификатором (lib/engine.mjs → verificationOf)
+    const { head: anyHead, signed: verifyHead } = verificationOf(ROOT, slug, text)
     const vr = verifyResult(ROOT, slug)
-    const loggedVerify = runLog.includes('verify__' + slug)
-    const verifyExpected = status === 'verified' || !!vr || loggedVerify
+    const verifyExpected = status === 'verified' || !!vr
 
     if (!verifyHead) {
       if (verifyExpected) {
-        blocker('Отчёты', p, 0, 'no-verification',
-          'в отчёте нет раздела «## Верификация», хотя верификация ' +
-          (status === 'verified' ? 'отмечена статусом темы' : 'числится в state') + ' — отчёт не достроен')
+        blocker('Отчёты', p, anyHead ? anyHead.line : 0, 'no-verification',
+          (anyHead ? 'раздел «' + anyHead.title + '» не подписан верификатором (нет результата verify__' + slug + ' и даты в заголовке)' : 'в отчёте нет раздела «## Верификация»') +
+          ', хотя верификация ' + (status === 'verified' ? 'отмечена статусом темы' : 'числится в state/results') + ' — отчёт не достроен')
       } else {
         warn('Отчёты', p, 0, 'verification-pending',
-          'верификации ещё не было: раздела «## Верификация» нет, статус темы «' + status + '»')
+          'верификации ещё не было: ' + (anyHead ? 'раздел «' + anyHead.title + '» написал не верификатор' : 'раздела «## Верификация» нет') + ', статус темы «' + status + '»')
       }
     }
 
@@ -477,17 +575,21 @@ if (doResearch || doSynth) {
 // ---- Своды
 if (doSynth) {
   for (const s of syntheses) {
-    // GAPS.md проверяется ниже, как файл финиша: он не надмножество отчётов, а их ревизия
-    if (isGaps(s)) continue
     const file = synthFileName(s)
     const p = path.join(ROOT, 'synthesis', file)
     const text = readText(p)
     const status = String(s.status || 'planned')
-    if (text == null) {
+    // GAPS.md — не надмножество отчётов, а их ревизия: порог четверти к нему не применяется,
+    // но done без файла — та же потеря, что у свода
+    if (isGaps(s)) {
+      if (status === 'done' && !countWords(text)) blocker('Своды', p, 0, 'no-synthesis-file', 'нет файла ' + file + ' (или он пуст), а запись gaps помечена done')
+      continue
+    }
+    if (text == null || !countWords(text)) {
       if (status === 'planned') {
         warn('Своды', p, 0, 'synthesis-planned', 'нет файла свода ' + file + ', статус planned — ещё не собран')
       } else {
-        blocker('Своды', p, 0, 'no-synthesis-file', 'нет файла свода ' + file + ', а статус свода «' + status + '»')
+        blocker('Своды', p, 0, 'no-synthesis-file', (text == null ? 'нет файла свода ' : 'пустой файл свода ') + file + ', а статус свода «' + status + '»')
       }
       continue
     }
@@ -536,7 +638,8 @@ if (doSynth) {
   }
 
   const finish = String(engine.finish || DEFAULT_FINISH)
-  const tail = [['synthesis/GAPS.md', path.join(ROOT, 'synthesis', 'GAPS.md')]]
+  const gapsRel = gapsRelPath(syntheses)
+  const tail = [[gapsRel, path.join(ROOT, gapsRel)]]
   if (finish === 'method') {
     tail.push(['METHOD.md', path.join(ROOT, 'METHOD.md')])
     tail.push(['AGENT.md', path.join(ROOT, 'AGENT.md')])
@@ -544,6 +647,31 @@ if (doSynth) {
   }
   for (const [name, p] of tail) {
     if (!isFile(p)) warn('Своды', p, 0, 'finish-file-missing', 'нет файла ' + name + ' — финиш «' + finish + '» не доведён')
+  }
+}
+
+// ---- Результаты агентов: файл state/results/<label>.json читают audit и status, а Workflow
+// проверяет по схеме только возврат в чат. Схема — копия в движке, иначе — в скилле.
+{
+  const SCHEMA_OF = { recon: 'file', research: 'research', verify: 'verify', synth: 'file', merge: 'file', critique: 'gaps', method: 'file' }
+  const resDir = path.join(ROOT, 'state', 'results')
+  let files = []
+  try { files = fs.readdirSync(resDir).filter(f => f.endsWith('.json') && !f.endsWith('.raw.json')).sort() } catch { /* каталога нет */ }
+  const schemaCache = {}
+  const schemaOf = (name) => {
+    if (!(name in schemaCache)) schemaCache[name] = readJson(path.join(ROOT, 'schemas', name + '.json')) || readJson(path.join(SKILL, 'schemas', name + '.json'))
+    return schemaCache[name]
+  }
+  for (const f of files) {
+    const prefix = f.split('__')[0]
+    if (!SCHEMA_OF[prefix]) continue
+    const stageOk = (prefix === 'research' || prefix === 'verify') ? doResearch : (prefix === 'recon' ? doPrompts : doSynth)
+    if (!stageOk) continue
+    const schema = schemaOf(SCHEMA_OF[prefix])
+    if (!schema) continue
+    const data = readJson(path.join(resDir, f))
+    const probs = data ? schemaProblems(data, schema) : ['файл не читается как JSON']
+    if (probs.length) warn('Отчёты', path.join(resDir, f), 0, 'result-schema', 'результат агента не по схеме ' + SCHEMA_OF[prefix] + '.json: ' + probs.slice(0, 5).join('; ') + ' — если файл записан прежней версией скилла, это след старой схемы, а не брак')
   }
 }
 
@@ -570,11 +698,11 @@ if (doSynth) {
   }
 }
 
-output()
+await output()
 
 // ---------------------------------------------------------------- вывод
 
-function output() {
+async function output() {
   const blockers = findings.filter(f => f.level === 'blocker')
   const warns = findings.filter(f => f.level === 'warn')
 
@@ -587,7 +715,7 @@ function output() {
       findings,
       notes,
     }, null, 2))
-    process.exit(blockers.length ? 1 : 0)
+    await flushAndExit(blockers.length ? 1 : 0)
   }
 
   const title = engine && engine.title ? engine.title : path.basename(ROOT)
@@ -614,7 +742,7 @@ function output() {
   } else {
     console.log('Блокеров и предупреждений нет.')
   }
-  process.exit(blockers.length ? 1 : 0)
+  await flushAndExit(blockers.length ? 1 : 0)
 }
 
 function line(f) {

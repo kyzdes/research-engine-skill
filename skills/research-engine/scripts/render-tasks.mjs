@@ -12,6 +12,7 @@ import {
   STAGES, DEFAULT_FINISH, DEFAULT_WORDS, normalizeEngine, synthFileName, isGaps,
   bankLayout, synthStageEntries, syncToolchain, toolchainDrift,
   normalizeBrief, jobsText, acceptanceText, inputsText, sourcesText, strList, MISSION_STUB_RE,
+  workflowArgs, syncStatuses, diskState, resolveRoot, shq, matrixFindings, gapsRelPath, takeValue,
 } from './lib/engine.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -56,17 +57,15 @@ const CONTRACT = new Set([
   'OTHER_LIST', 'ALL_REPORTS', 'ALL_SYNTHESIS', 'SYNTH_LABEL', 'CORPUS_SIZE',
   // бриф: какую работу делает база и по каким вопросам проверяется её готовность
   'REQUEST', 'JOBS', 'ACCEPTANCE_LIST', 'TOPIC_ACCEPTANCE', 'INPUTS_LIST', 'SOURCES_POLICY',
+  // файл критика полноты: у записи gaps может быть своё имя
+  'GAPS_PATH',
 ])
 
 // ---------------------------------------------------------------- аргументы
 
 function parseArgs(argv) {
   const out = { root: '', stage: '', labels: [], today: '', force: false, dryRun: false }
-  const take = (name, i) => {
-    const v = argv[i + 1]
-    if (v === undefined || v.startsWith('--')) die('у аргумента ' + name + ' нет значения')
-    return v
-  }
+  const take = (name, i) => takeValue(argv, i, name)
   const set = (key, value, raw) => {
     if (key === 'root') out.root = value
     else if (key === 'stage') out.stage = value
@@ -87,7 +86,7 @@ function parseArgs(argv) {
   if (!out.stage) die('не задан --stage ' + STAGES.join('|') + '\n\n' + USAGE)
   if (!STAGES.includes(out.stage)) die('--stage принимает ' + STAGES.join(' | ') + ', получено: ' + out.stage)
   if (out.today && !isISODate(out.today)) die('--today ждёт дату в формате YYYY-MM-DD, получено: ' + out.today)
-  out.root = path.resolve(out.root)
+  out.root = resolveRoot(out.root)
   if (!isDir(out.root)) die('каталог движка не найден: ' + out.root)
   return out
 }
@@ -100,12 +99,12 @@ const STAGE = argv.stage
 
 const enginePath = path.join(ROOT, 'engine.json')
 const engineText = readText(enginePath)
-if (engineText == null) die('нет файла engine.json в ' + ROOT + ' — движок не заведён или указан не тот --root. Заводится он так: node ' + path.join(SKILL, 'scripts', 'engine-init.mjs') + ' --root ' + ROOT + ' --slug <slug>')
+if (engineText == null) die('нет файла engine.json в ' + ROOT + ' — движок не заведён или указан не тот --root. Заводится он так: node ' + shq(path.join(SKILL, 'scripts', 'engine-init.mjs')) + ' --root ' + shq(ROOT) + ' --slug <slug> --request "<запрос дословно>"')
 let engine
 try { engine = JSON.parse(engineText) } catch (e) { die('engine.json не читается как JSON: ' + e.message) }
 if (!engine || typeof engine !== 'object' || Array.isArray(engine)) {
   die('engine.json должен быть объектом состояния движка, а не ' + (Array.isArray(engine) ? 'массивом' : typeof engine) +
-    ' (' + enginePath + '). Пересобери каркас: node ' + path.join(SKILL, 'scripts', 'engine-init.mjs') + ' --root ' + ROOT + ' --slug <slug> --force')
+    ' (' + enginePath + '). Пересобери каркас: node ' + shq(path.join(SKILL, 'scripts', 'engine-init.mjs')) + ' --root ' + shq(ROOT) + ' --slug <slug> --force')
 }
 
 const { topics, syntheses } = normalizeEngine(engine)
@@ -217,14 +216,19 @@ const NO_TOPIC_ACCEPTANCE = 'тема не привязана к контрол�
 // ---------------------------------------------------------------- банк фактов частями
 
 const { entry: bankEntry, parts: bankParts } = bankLayout(syntheses)
+const GAPS_PATH = path.join(ROOT, gapsRelPath(syntheses))
 
 // ---------------------------------------------------------------- сборка задач стадии
 
-function topicTasks(prefix) {
+// withResearch — задачи верификатора рендерятся вместе с задачами ресерча: research.mjs
+// гоняет ресерчера и следом верификатора, и верификатору нужен свой файл задачи. Отчёта на
+// момент рендера ещё нет — это ожидаемо, предупреждения об этом не печатаются.
+function topicTasks(prefix, withResearch = false) {
   if (!topics.length) die('в engine.json нет тем: стадия ' + STAGE + ' рендерить нечего. Сначала декомпозиция — ТЗ в prompts/ и темы в topics.')
   return topics.map(t => ({
     label: prefix + '__' + t.slug,
     short: String(t.slug),
+    template: prefix,
     values: {
       TOPIC_SLUG: String(t.slug),
       TOPIC_TITLE: String(t.title || t.slug),
@@ -233,7 +237,7 @@ function topicTasks(prefix) {
       TARGET_WORDS: String(reportWords),
       TOPIC_ACCEPTANCE: acceptanceText(acceptanceOf([String(t.slug)]), NO_TOPIC_ACCEPTANCE),
     },
-    needs: prefix === 'research'
+    needs: prefix === 'research' || withResearch
       ? [{ p: promptPath(t.slug), what: 'ТЗ ресерча' }]
       : [{ p: promptPath(t.slug), what: 'ТЗ ресерча' }, { p: reportPath(t.slug), what: 'отчёт для верификации' }],
   }))
@@ -286,7 +290,7 @@ function buildTasks() {
       JOBS: jobsText(brief, 'работа базы ещё выясняется — первый круг вопросов заказчику идёт параллельно с тобой; варианты работ предложи в разделе 6'),
     })
   }
-  if (STAGE === 'research') return topicTasks('research')
+  if (STAGE === 'research') return [...topicTasks('research'), ...topicTasks('verify', true)]
   if (STAGE === 'verify') return topicTasks('verify')
   if (STAGE === 'synth') return synthTasks()
   if (STAGE === 'merge') {
@@ -314,12 +318,14 @@ function buildTasks() {
     return singleTask('method__method', {
       OUT_PATH: path.join(ROOT, 'METHOD.md'),
       TARGET_WORDS: String(synthWords),
-    }, [{ p: path.join(ROOT, 'synthesis', 'GAPS.md'), what: 'вердикт критика полноты' }])
+      GAPS_PATH: GAPS_PATH,
+    }, [{ p: GAPS_PATH, what: 'вердикт критика полноты' }])
   }
   return singleTask('method__agent', {
     OUT_PATH: path.join(ROOT, 'AGENT.md'),
     TARGET_WORDS: String(synthWords),
-  }, [{ p: path.join(ROOT, 'METHOD.md'), what: 'методика, вход в которую пишется' }])
+    GAPS_PATH: GAPS_PATH,
+  }, [{ p: path.join(ROOT, 'METHOD.md'), what: 'методика, вход в которую пишется' }, { p: path.join(ROOT, 'INDEX.md'), what: 'карта сводов (build-index.mjs)' }])
 }
 
 let tasks = buildTasks()
@@ -331,27 +337,38 @@ if ((STAGE === 'method' || STAGE === 'agent-doc') && String(engine.finish || DEF
 // ---------------------------------------------------------------- фильтр --labels
 
 if (argv.labels.length) {
-  const byName = new Map()
-  for (const t of tasks) { byName.set(t.label, t); byName.set(t.short, t) }
+  // Короткое имя выбирает все задачи темы стадии: на стадии research это ресерчер и верификатор.
+  // Полная метка research__x на этой стадии тоже тянет verify__x: research.mjs запустит обоих.
   const picked = []
   for (const name of argv.labels) {
-    const t = byName.get(name)
-    if (!t) {
+    const slug = STAGE === 'research' && name.startsWith('research__') ? name.slice('research__'.length) : null
+    const hit = tasks.filter(t => t.label === name || t.short === name || (slug != null && t.short === slug))
+    if (!hit.length) {
       die('метка ' + name + ' на стадии ' + STAGE + ' неизвестна. Доступны: ' +
-        tasks.map(x => x.short).join(', ') + ' (полные имена: ' + tasks.map(x => x.label).join(', ') + ')')
+        [...new Set(tasks.map(x => x.short))].join(', ') + ' (полные имена: ' + tasks.map(x => x.label).join(', ') + ')')
     }
-    if (!picked.includes(t)) picked.push(t)
+    for (const t of hit) if (!picked.includes(t)) picked.push(t)
   }
   tasks = picked
 }
 
 // ---------------------------------------------------------------- рендер
 
-const tplPath = path.join(TEMPLATES, STAGE + '.task.md')
-const tpl = readText(tplPath)
-if (tpl == null) die('нет шаблона стадии: ' + tplPath + '\nПроверь, что скилл установлен целиком: ' + SKILL)
+// Шаблон — свойство задачи: на стадии research рендерятся и research.task.md, и verify.task.md.
+const tplCache = new Map()
+function templateOf(task) {
+  const name = task.template || STAGE
+  if (!tplCache.has(name)) {
+    const p = path.join(TEMPLATES, name + '.task.md')
+    const text = readText(p)
+    if (text == null) die('нет шаблона стадии: ' + p + '\nПроверь, что скилл установлен целиком: ' + SKILL)
+    tplCache.set(name, { path: p, text })
+  }
+  return tplCache.get(name)
+}
 
 function render(task) {
+  const { path: tplPath, text: tpl } = templateOf(task)
   const values = { ...COMMON, ...task.values, LABEL: task.label, RESULT_PATH: resultPath(task.label) }
   const unknown = []
   const inapplicable = []
@@ -378,15 +395,24 @@ const rows = []
 const skipped = []
 const warnings = []
 
+// На разведке периметра ещё нет: его задают по её итогам, предупреждать не о чем.
 const emptyPerim = []
-if (!(Array.isArray(perim.in) ? perim.in.filter(Boolean).length : 0)) emptyPerim.push('perimeter.in')
-if (!(Array.isArray(perim.out) ? perim.out.filter(Boolean).length : 0)) emptyPerim.push('perimeter.out')
-if (emptyPerim.length) warnings.push('в engine.json пусто поле ' + emptyPerim.join(' и ') + ' — вместо границ темы в промпт уходит просьба их заполнить. Задай периметр и перерендери с --force')
+if (!strList(perim.in).length) emptyPerim.push('perimeter.in')
+if (!strList(perim.out).length) emptyPerim.push('perimeter.out')
+if (STAGE !== 'recon' && emptyPerim.length) warnings.push('в engine.json пусто поле ' + emptyPerim.join(' и ') + ' — вместо границ темы в промпт уходит просьба их заполнить. Задай периметр и перерендери с --force')
+
+if (STAGE === 'synth' || STAGE === 'merge') for (const m of matrixFindings({ topics, syntheses })) warnings.push(m)
 
 const FS_HINT = '\nПроверь права на каталог state/tasks и что --root ведёт в каталог движка.'
 
 let toolchain = []
+let statusChanges = []
+let state = null
 if (!argv.dryRun) {
+  // Статусы сверяются с диском перед каждой стадией: Workflow-исполнители engine.json не
+  // трогают, а по статусам строятся чек-лист и следующая партия.
+  try { const synced = syncStatuses(ROOT, engine, 'render-tasks'); statusChanges = synced.changes; state = synced.state }
+  catch (e) { console.error('Предупреждение: статусы не сверены с диском — ' + e.message) }
   // state/results заводим здесь же: путь результата уходит в промпт, а записывает его агент —
   // если каталога нет, агент упирается в ENOENT последним действием, когда работа уже сделана.
   for (const d of [path.join(ROOT, 'state', 'tasks'), path.join(ROOT, 'state', 'results')]) {
@@ -419,7 +445,7 @@ for (const task of tasks) {
 // ---------------------------------------------------------------- вывод
 
 console.log((argv.dryRun ? 'ПЛАН (--dry-run, на диск ничего не записано)' : 'Отрендерено') +
-  ': стадия ' + STAGE + ' · шаблон ' + path.relative(SKILL, tplPath) + ' · ' + tasks.length + ' ' + plural(tasks.length, 'задача', 'задачи', 'задач'))
+  ': стадия ' + STAGE + ' · шаблон ' + [...new Set(tasks.map(t => path.relative(SKILL, templateOf(t).path)))].join(', ') + ' · ' + tasks.length + ' ' + plural(tasks.length, 'задача', 'задачи', 'задач'))
 console.log('Корпус на диске: ' + CORPUS_SIZE)
 console.log('')
 
@@ -446,6 +472,11 @@ if (skipped.length && !argv.force) {
   console.log('Не тронуто файлов: ' + skipped.length + '. Перерендерить поверх — повтори с --force (это нужно всегда, когда правил mission, периметр или состав тем).')
 }
 
+if (statusChanges.length) {
+  console.log('')
+  console.log('Статусы сверены с диском и записаны в engine.json: ' + statusChanges.join(', '))
+}
+
 if (toolchain.length) {
   console.log('')
   console.log('Копии исполнителей и схем в движке ' + (argv.dryRun ? 'отстают от скилла' : 'приведены к версии скилла') + ': ' + toolchain.join(', '))
@@ -453,24 +484,51 @@ if (toolchain.length) {
 
 if (warnings.length) {
   console.log('')
-  console.log('Предупреждения (задача отрендерена, но агенту нечего будет читать):')
+  console.log('Предупреждения (задачи отрендерены; разберись до прогона — агент получит то, что видишь здесь):')
   for (const w of warnings) console.log('  · ' + w)
 }
 
-const script = (name) => path.join(SKILL, 'scripts', name)
-const afterBatch = 'После партии: node ' + script('status.mjs') + ' --root ' + ROOT +
-  ' --write (статусы тем и сводов, строка в state/run-log.md), затем node ' + script('audit.mjs') + ' --root ' + ROOT + '.'
-const codexRun = 'node ' + script('fanout.mjs') + ' --root ' + ROOT + ' --stage ' + STAGE + ' --engine codex --concurrency 3'
+const script = (name) => shq(path.join(SKILL, 'scripts', name))
+const R = shq(ROOT)
+const afterBatch = 'После партии: расход — node ' + script('status.mjs') + ' --root ' + R + ' --record <стадия> --agents <N> --tokens <T> --minutes <M>; статусы и следующая команда — node ' +
+  script('status.mjs') + ' --root ' + R + '; проверка — node ' + script('audit.mjs') + ' --root ' + R + '.'
+
+// Первая партия — из того, что ещё не сделано: готовые темы и своды в неё не попадают.
+// С явными --labels партия — ровно они.
+if (!state) { try { state = diskState(engine, ROOT) } catch { state = null } }
+const isPending = (short) => {
+  if (!state) return true
+  if (STAGE === 'research') { const r = state.topicRows.find(x => x.slug === short); return !r || (r.derived === 'planned' && !r.inProgress) }
+  if (STAGE === 'verify') { const r = state.topicRows.find(x => x.slug === short); return !r || r.derived === 'researched' }
+  if (STAGE === 'synth') { const r = state.synthRows.find(x => x.label === short); return !r || r.derived !== 'done' }
+  // одиночные стадии: задача сделана, если её файл уже на диске
+  const out = { recon: path.join(ROOT, 'brief', 'RECON.md'), merge: bankEntry ? synthFile(bankEntry) : path.join(ROOT, 'synthesis', 'FACTS-BANK.md'),
+    critique: GAPS_PATH, method: path.join(ROOT, 'METHOD.md'), 'agent-doc': path.join(ROOT, 'AGENT.md') }[STAGE]
+  return !out || !countWords(readText(out))
+}
+const uniqShorts = [...new Set(tasks.map(t => t.short))]
+const BATCH = STAGE === 'research' || STAGE === 'verify' || STAGE === 'synth' ? 4 : uniqShorts.length
+const pending = argv.labels.length ? uniqShorts : uniqShorts.filter(isPending)
+const shorts = pending.slice(0, BATCH)
+const wfArgs = JSON.stringify(workflowArgs(engine, ROOT, STAGE, shorts))
+const prefixOf = { recon: 'recon', research: 'research', verify: 'verify', synth: 'synth', merge: 'merge', critique: 'critique', method: 'method', 'agent-doc': 'method' }
+const fanout = (stage, ls) => 'node ' + script('fanout.mjs') + ' --root ' + R + ' --stage ' + stage + ' --labels ' + ls.map(l => prefixOf[stage] + '__' + l).join(',') + ' --engine codex --concurrency 3'
+const wf = (file) => 'Workflow ' + path.join(ROOT, 'workflows', file)
 
 console.log('')
 if (argv.dryRun) {
   console.log('Дальше: повтори без --dry-run, чтобы записать файлы задач.')
+} else if (!shorts.length) {
+  console.log('Дальше: все задачи стадии ' + STAGE + ' уже сделаны — следующую команду печатает node ' + script('status.mjs') + ' --root ' + R + '.')
 } else if (STAGE === 'recon') {
-  console.log('Дальше: Workflow ' + ROOT + '/workflows/synthesis.mjs с args.stage = "recon" и args.labels = ["field"] (один агент, можно effort "medium"), либо ' + codexRun + '. Пока он идёт — первый круг вопросов заказчику о работе базы (references/BRIEF.md §3). Потом: прочитай brief/RECON.md, второй круг вопросов, заполни brief в engine.json и node ' + script('brief.mjs') + ' --root ' + ROOT + ' --write.')
+  console.log('Дальше: ' + wf('synthesis.mjs') + ' с args ' + wfArgs + ', либо ' + fanout('recon', shorts) + '. Пока он идёт — первый круг вопросов заказчику о работе базы (references/BRIEF.md §3). Потом: прочитай brief/RECON.md, второй круг вопросов, заполни brief в engine.json и node ' + script('brief.mjs') + ' --root ' + R + ' --write.')
 } else if (STAGE === 'research') {
-  console.log('Дальше: партия 3-4 темы — Workflow ' + ROOT + '/workflows/research.mjs с args.labels из колонки label (префикс стадии можно не писать; верификатор идёт следом сам), либо ' + codexRun + '. ' + afterBatch)
+  console.log('Дальше: партия ' + shorts.length + ' из ' + pending.length + (argv.labels.length ? '' : ' непрогнанных') + ' — ' + wf('research.mjs') + ' с args ' + wfArgs +
+    ' (верификатор идёт следом сам, его задачи уже отрендерены; следующие партии — те же args с другими labels).')
+  console.log('В Codex ресерч и верификация — два прогона: ' + fanout('research', shorts) + ', затем ' + fanout('verify', shorts) + '.')
+  console.log(afterBatch)
 } else if (STAGE === 'verify') {
-  console.log('Дальше: Workflow ' + ROOT + '/workflows/research.mjs с args.stage = "verify" — только верификатор, отчёт не пишется заново; либо ' + codexRun + '. ' + afterBatch)
+  console.log('Дальше: ' + wf('research.mjs') + ' с args ' + wfArgs + ' — только верификатор, отчёт не пишется заново; либо ' + fanout('verify', shorts) + '. ' + afterBatch)
 } else {
-  console.log('Дальше: партия 3-4 задачи — Workflow ' + ROOT + '/workflows/synthesis.mjs с args.stage = "' + STAGE + '" и args.labels из колонки label, либо ' + codexRun + '. ' + afterBatch)
+  console.log('Дальше: ' + (pending.length > shorts.length ? 'партия ' + shorts.length + ' из ' + pending.length + ' — ' : '') + wf('synthesis.mjs') + ' с args ' + wfArgs + ', либо ' + fanout(STAGE, shorts) + '. ' + afterBatch)
 }
