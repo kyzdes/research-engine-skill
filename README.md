@@ -29,11 +29,22 @@
 
 ## Установка
 
-Claude Code:
+Нужен Node 18+: скрипты движка запускаются через `node`.
+
+Claude Code — в терминале (внутри сессии те же команды: `/plugin marketplace add …`, `/plugin install …`):
+
+```
+claude plugin marketplace add kyzdes/claude-skills
+claude plugin install research-engine@claude-skills
+```
+
+Затем перезапусти Claude Code: скилл подхватывается новой сессией. Дальше — «собери базу знаний по теме …» или `/engine new`.
+
+Обновить до свежей версии:
 
 ```
 claude plugin marketplace update claude-skills
-claude plugin install research-engine@claude-skills
+claude plugin update research-engine@claude-skills
 ```
 
 Codex:
