@@ -4,6 +4,9 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import {
+  die, isDir, isFile, readText, readJson, countWords, fmt, plural, codeFenceMask, synthFileName, todayISO,
+} from './lib/engine.mjs'
 
 const USAGE = `build-index.mjs — карта сводов: когда открывать, сколько строк и слов, «строка | раздел».
 
@@ -19,11 +22,6 @@ const USAGE = `build-index.mjs — карта сводов: когда откр�
 в engine.json, идут в конец. METHOD.md подхватывается из корня движка первой строкой карты.`
 
 // ---------------------------------------------------------------- аргументы
-
-function die(msg, code = 2) {
-  console.error('Ошибка: ' + msg)
-  process.exit(code)
-}
 
 function parseArgs(argv) {
   const out = { root: '', dir: 'synthesis', out: 'INDEX.md', maxDepth: 2 }
@@ -51,36 +49,7 @@ function parseArgs(argv) {
   return out
 }
 
-// ---------------------------------------------------------------- файлы
-
-function isDir(p) { try { return fs.statSync(p).isDirectory() } catch { return false } }
-function isFile(p) { try { return fs.statSync(p).isFile() } catch { return false } }
-function readText(p) { try { return fs.readFileSync(p, 'utf8') } catch { return null } }
-function readJson(p) { const t = readText(p); if (t == null) return null; try { return JSON.parse(t) } catch { return null } }
-
-const countWords = (t) => (t ? (t.match(/[\p{L}\p{N}][\p{L}\p{N}'’\-]*/gu) || []).length : 0)
-const fmt = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ' ')
-
-const plural = (n, one, few, many) => {
-  const a = Math.abs(n) % 100
-  const b = a % 10
-  if (a > 10 && a < 20) return many
-  if (b > 1 && b < 5) return few
-  if (b === 1) return one
-  return many
-}
-
 // ---------------------------------------------------------------- разбор md
-
-function codeFenceMask(lines) {
-  const mask = new Array(lines.length).fill(false)
-  let inFence = false
-  for (let i = 0; i < lines.length; i++) {
-    if (/^\s*(```|~~~)/.test(lines[i])) { inFence = !inFence; mask[i] = true; continue }
-    mask[i] = inFence
-  }
-  return mask
-}
 
 function scan(text, maxDepth) {
   const lines = text.split('\n')
@@ -155,7 +124,7 @@ const present = fs.readdirSync(DIR).filter(f => f.endsWith('.md')).sort()
 const ordered = []
 const seen = new Set()
 for (const s of syntheses) {
-  const file = s.file || (s.label ? String(s.label).toUpperCase() + '.md' : '')
+  const file = (s.file || s.label) ? synthFileName(s) : ''
   if (!file || seen.has(file)) continue
   if (!present.includes(file)) continue
   seen.add(file)
@@ -228,7 +197,8 @@ for (const e of entries) {
   blocks.push(b.join('\n'))
 }
 
-const today = engine.today || new Date().toISOString().slice(0, 10)
+// дата снятия номеров строк — сегодняшняя, а не дата заведения движка
+const today = todayISO()
 const title = engine.title || engine.slug || path.basename(ROOT)
 const volume = totalWords >= 10000
   ? 'около ' + fmt(Math.round(totalWords / 1000)) + ' ' +

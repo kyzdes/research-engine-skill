@@ -24,17 +24,18 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { STAGES, PREFIX_BY_STAGE, normalizeEngine, stageLabels, appendRunLogRow, todayISO } from './lib/engine.mjs'
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const SKILL_DIR = path.resolve(SCRIPT_DIR, '..')
-
-const STAGES = ['research', 'verify', 'synth', 'merge', 'critique', 'method', 'agent-doc']
+const script = (name) => path.join(SCRIPT_DIR, name)
 
 // Стадии, где отчёт без интернета — брак.
-const WEB_STAGES = ['research', 'verify']
+const WEB_STAGES = ['recon', 'research', 'verify']
 
 // Стадия → схема возврата (§5 контракта). Ключ — префикс label до двойного подчёркивания.
 const SCHEMA_BY_PREFIX = {
+  recon: 'file.json',
   research: 'research.json',
   verify: 'verify.json',
   synth: 'file.json',
@@ -180,34 +181,20 @@ function loadEngine(root) {
     fail(p + ' — не объект. Внутри должен лежать один JSON-объект движка: slug, topics, syntheses')
   }
   // §3: скрипт переживает отсутствие необязательных полей и не падает на лишних.
+  const { topics, syntheses } = normalizeEngine(e)
   return {
     slug: typeof e.slug === 'string' ? e.slug : '',
     title: typeof e.title === 'string' ? e.title : '',
-    topics: Array.isArray(e.topics) ? e.topics.filter(t => t && typeof t.slug === 'string') : [],
-    syntheses: Array.isArray(e.syntheses) ? e.syntheses.filter(s => s && typeof s.label === 'string') : [],
+    topics,
+    syntheses,
   }
-}
-
-// §4: имена задач. Стадия → список labels.
-function labelsForStage(stage, engine) {
-  if (stage === 'research') return engine.topics.map(t => 'research__' + t.slug)
-  if (stage === 'verify') return engine.topics.map(t => 'verify__' + t.slug)
-  if (stage === 'synth') return engine.syntheses.map(s => 'synth__' + s.label)
-  if (stage === 'merge') return ['merge__facts-bank']
-  if (stage === 'critique') return ['critique__gaps']
-  if (stage === 'method') return ['method__method']
-  if (stage === 'agent-doc') return ['method__agent']
-  return []
-}
-
-const PREFIX_BY_STAGE = {
-  research: 'research', verify: 'verify', synth: 'synth',
-  merge: 'merge', critique: 'critique', method: 'method', 'agent-doc': 'method',
 }
 
 function normalizeLabels(opts, engine) {
   if (!opts.labels.length) {
-    const list = labelsForStage(opts.stage, engine)
+    // §4: тот же набор меток, что рендерит render-tasks.mjs — без GAPS.md и навигатора банка
+    // на стадии synth, иначе прогон падает на «нет файлов задач».
+    const list = stageLabels(opts.stage, engine)
     if (!list.length) {
       fail('в engine.json нет ни одной задачи для стадии ' + opts.stage +
         '. Для research и verify нужен непустой topics, для synth — syntheses')
@@ -540,19 +527,18 @@ function table(jobs, results) {
 }
 
 function appendRunLog(root, opts, jobs, results, sec) {
-  const okCount = jobs.filter(j => (results.get(j.label) || {}).ok).length
-  const line = '- ' + new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC · fanout · стадия ' +
-    (opts.stage || 'по списку labels') + ' · хост ' + opts.engine + ' · задач ' + jobs.length +
-    ' · успешно ' + okCount + ' · провалено ' + (jobs.length - okCount) +
-    ' · параллельно ' + opts.concurrency + ' · модель ' + (opts.model || 'по умолчанию хоста') +
-    ' · усилие ' + (opts.effort || 'по умолчанию хоста') +
-    ' · веб-поиск ' + (opts.webSearch ? 'вкл' : 'выкл') + ' · ' + Math.round(sec / 60) + ' мин\n'
-  const p = path.join(root, 'state', 'run-log.md')
+  const ok = jobs.filter(j => (results.get(j.label) || {}).ok).map(j => j.label)
+  const failed = jobs.map(j => j.label).filter(l => !ok.includes(l))
+  const note = 'fanout · параллельно ' + opts.concurrency + ' · модель ' + (opts.model || 'по умолчанию хоста') +
+    ' · усилие ' + (opts.effort || 'по умолчанию хоста') + ' · веб-поиск ' + (opts.webSearch ? 'вкл' : 'выкл') +
+    ' · ' + Math.round(sec / 60) + ' мин' + (failed.length ? ' · упали: ' + failed.join(', ') : '')
   try {
-    fs.mkdirSync(path.dirname(p), { recursive: true })
-    fs.appendFileSync(p, fs.existsSync(p) ? line : '# Журнал прогонов\n\n' + line)
+    appendRunLogRow(root, [
+      todayISO(), opts.stage || 'по списку labels', opts.engine, jobs.map(j => j.label).join(', '),
+      ok.length + '/' + jobs.length + ' успешно', note,
+    ])
   } catch (e) {
-    console.error('Не удалось дописать ' + p + ': ' + e.message)
+    console.error('Не удалось дописать ' + path.join(root, 'state', 'run-log.md') + ': ' + e.message)
   }
 }
 
@@ -566,7 +552,7 @@ let labels = normalizeLabels(opts, engine)
 const missing = labels.filter(l => !fs.existsSync(path.join(opts.root, 'state', 'tasks', l + '.md')))
 if (missing.length) {
   fail('нет файлов задач для: ' + missing.join(', ') +
-    '\n  Сначала отрендерь их: node render-tasks.mjs --root ' + opts.root +
+    '\n  Сначала отрендерь их: node ' + script('render-tasks.mjs') + ' --root ' + opts.root +
     (opts.stage ? ' --stage ' + opts.stage : ''))
 }
 
@@ -575,7 +561,8 @@ if (opts.skipDone) {
   labels = labels.filter(l => !fs.existsSync(path.join(opts.root, 'state', 'results', l + '.json')))
   if (before !== labels.length) console.log('Пропущено готовых задач: ' + (before - labels.length) + ' (--skip-done)')
   if (!labels.length) {
-    console.log('Все задачи стадии уже сделаны. Дальше: node audit.mjs --root ' + opts.root)
+    console.log('Все задачи стадии уже сделаны. Дальше: node ' + script('status.mjs') + ' --root ' + opts.root +
+      ' --write, затем node ' + script('audit.mjs') + ' --root ' + opts.root)
     process.exit(0)
   }
 }
@@ -603,9 +590,9 @@ if (opts.engine === 'codex') {
 // а интернет задаче нужен ровно так же.
 const webJobs = jobs.filter(j => WEB_STAGES.includes(j.label.split('__')[0]))
 if (!opts.webSearch && webJobs.length) {
-  console.error('Внимание: --web-search off, а среди задач есть research/verify (' +
+  console.error('Внимание: --web-search off, а среди задач есть recon/research/verify (' +
     webJobs.map(j => j.label).join(', ') +
-    '). Без веб-поиска отчёт пишется по памяти модели — это брак, а не экономия.')
+    '). Без веб-поиска отчёт и разведка пишутся по памяти модели — это брак, а не экономия.')
 }
 
 if (opts.dryRun) {
@@ -651,7 +638,8 @@ if (fatal && !interrupted) {
 if (failed.length) {
   console.log('Упали: ' + failed.join(', '))
   console.log('Смотри логи в ' + path.join(opts.root, 'state', 'logs') + ', затем перезапусти только упавшие:')
-  console.log('  node fanout.mjs --root ' + opts.root + ' --labels ' + failed.join(','))
+  console.log('  node ' + script('fanout.mjs') + ' --root ' + opts.root + ' --labels ' + failed.join(','))
   process.exit(1)
 }
-console.log('Дальше: node audit.mjs --root ' + opts.root + ' — проверка закона конвейера по этой стадии.')
+console.log('Дальше: node ' + script('status.mjs') + ' --root ' + opts.root + ' --write — статусы тем и сводов по диску;')
+console.log('  затем node ' + script('audit.mjs') + ' --root ' + opts.root + ' — проверка закона конвейера по этой стадии.')

@@ -31,7 +31,12 @@
       "type": "array",
       "items": { "type": "string" },
       "description": "блокеры финиша: что обязано быть закрыто до METHOD.md; пустой массив при вердикте ready"
+    },
+    "acceptance": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "контрольные вопросы брифа: по строке на вопрос — «A1 — отвечено | частично | нет — адрес ответа или чего не хватает»; пустой массив, если вопросов в брифе нет"
     }
   },
-  "required": ["path", "verdict", "losses", "holes", "risks", "blockers"]
+  "required": ["path", "verdict", "losses", "holes", "risks", "blockers", "acceptance"]
 }

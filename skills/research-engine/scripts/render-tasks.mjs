@@ -7,27 +7,34 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  die, isDir, isFile, readText, countWords, fmt, plural, todayISO, isISODate,
+  STAGES, DEFAULT_FINISH, DEFAULT_WORDS, normalizeEngine, synthFileName, isGaps,
+  bankLayout, synthStageEntries, syncToolchain, toolchainDrift,
+  normalizeBrief, jobsText, acceptanceText, inputsText, sourcesText, strList, MISSION_STUB_RE,
+} from './lib/engine.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const SKILL = path.resolve(HERE, '..')
 const TEMPLATES = path.join(SKILL, 'templates')
 
-const STAGES = ['research', 'verify', 'synth', 'merge', 'critique', 'method', 'agent-doc']
-
 const USAGE = `render-tasks.mjs — рендерит файлы задач движка из шаблонов стадии.
 
-  node render-tasks.mjs --root <path> --stage research|verify|synth|merge|critique|method|agent-doc
-                        [--labels a,b] [--force] [--dry-run]
+  node render-tasks.mjs --root <path> --stage recon|research|verify|synth|merge|critique|method|agent-doc
+                        [--labels a,b] [--today YYYY-MM-DD] [--force] [--dry-run]
 
   --root     каталог движка (в нём лежит engine.json). Обязателен.
   --stage    какую стадию рендерить. Обязателен.
   --labels   ограничить набор: через запятую, полные метки (research__01-slug)
              или короткие имена (01-slug, field-spec).
+  --today    дата «Сегодня» в промптах. По умолчанию — сегодняшняя дата рендера, а не дата
+             заведения движка: агент по ней решает, что устарело, и ею подписывает проверку.
   --force    перезаписать уже отрендеренные файлы задач
   --dry-run  всё отрендерить, ничего не записать; при одной задаче напечатать текст целиком
   --help     эта справка
 
 Метки стадий (контракт движка):
+  recon      recon__field  (разведка предмета на стадии брифа → brief/RECON.md)
   research   research__<topic-slug>   verify   verify__<topic-slug>
   synth      synth__<label>           merge    merge__facts-bank
   critique   critique__gaps           method   method__method
@@ -39,22 +46,6 @@ const USAGE = `render-tasks.mjs — рендерит файлы задач дв�
 
 // ---------------------------------------------------------------- утилиты
 
-function die(msg, code = 2) {
-  console.error('Ошибка: ' + msg)
-  process.exit(code)
-}
-
-function isDir(p) { try { return fs.statSync(p).isDirectory() } catch { return false } }
-function isFile(p) { try { return fs.statSync(p).isFile() } catch { return false } }
-function readText(p) { try { return fs.readFileSync(p, 'utf8') } catch { return null } }
-const fmt = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ' ')
-const countWords = (t) => (t ? (t.match(/[\p{L}\p{N}][\p{L}\p{N}'’\-]*/gu) || []).length : 0)
-const plural = (n, one, few, many) => {
-  const m10 = n % 10, m100 = n % 100
-  if (m10 === 1 && m100 !== 11) return one
-  if (m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20)) return few
-  return many
-}
 const words = (w) => (w >= 10000 ? fmt(Math.round(w / 1000)) + ' тыс. слов' : fmt(w) + ' ' + plural(w, 'слово', 'слова', 'слов'))
 
 // плейсхолдеры контракта: всё, чего нет в этом списке, — опечатка в шаблоне
@@ -63,12 +54,14 @@ const CONTRACT = new Set([
   'PROFILE', 'FINISH', 'LABEL', 'TOPIC_SLUG', 'TOPIC_TITLE', 'PROMPT_PATH', 'REPORT_PATH',
   'RESULT_PATH', 'SPEC_PATH', 'OUT_PATH', 'TARGET_WORDS', 'PRIMARY_LIST', 'SECONDARY_LIST',
   'OTHER_LIST', 'ALL_REPORTS', 'ALL_SYNTHESIS', 'SYNTH_LABEL', 'CORPUS_SIZE',
+  // бриф: какую работу делает база и по каким вопросам проверяется её готовность
+  'REQUEST', 'JOBS', 'ACCEPTANCE_LIST', 'TOPIC_ACCEPTANCE', 'INPUTS_LIST', 'SOURCES_POLICY',
 ])
 
 // ---------------------------------------------------------------- аргументы
 
 function parseArgs(argv) {
-  const out = { root: '', stage: '', labels: [], force: false, dryRun: false }
+  const out = { root: '', stage: '', labels: [], today: '', force: false, dryRun: false }
   const take = (name, i) => {
     const v = argv[i + 1]
     if (v === undefined || v.startsWith('--')) die('у аргумента ' + name + ' нет значения')
@@ -78,6 +71,7 @@ function parseArgs(argv) {
     if (key === 'root') out.root = value
     else if (key === 'stage') out.stage = value
     else if (key === 'labels') out.labels = value.split(',').map(s => s.trim()).filter(Boolean)
+    else if (key === 'today') out.today = value
     else die('неизвестный аргумент ' + raw + '\n\n' + USAGE)
   }
   for (let i = 0; i < argv.length; i++) {
@@ -92,6 +86,7 @@ function parseArgs(argv) {
   if (!out.root) die('не задан --root <path>\n\n' + USAGE)
   if (!out.stage) die('не задан --stage ' + STAGES.join('|') + '\n\n' + USAGE)
   if (!STAGES.includes(out.stage)) die('--stage принимает ' + STAGES.join(' | ') + ', получено: ' + out.stage)
+  if (out.today && !isISODate(out.today)) die('--today ждёт дату в формате YYYY-MM-DD, получено: ' + out.today)
   out.root = path.resolve(out.root)
   if (!isDir(out.root)) die('каталог движка не найден: ' + out.root)
   return out
@@ -113,13 +108,12 @@ if (!engine || typeof engine !== 'object' || Array.isArray(engine)) {
     ' (' + enginePath + '). Пересобери каркас: node ' + path.join(SKILL, 'scripts', 'engine-init.mjs') + ' --root ' + ROOT + ' --slug <slug> --force')
 }
 
-const topics = (Array.isArray(engine.topics) ? engine.topics : []).filter(t => t && t.slug)
-const syntheses = (Array.isArray(engine.syntheses) ? engine.syntheses : []).filter(s => s && (s.label || s.file))
+const { topics, syntheses } = normalizeEngine(engine)
 const topicBySlug = new Map(topics.map(t => [String(t.slug), t]))
 
 const targetWords = engine.targetWords || {}
-const reportWords = Number(targetWords.report) > 0 ? Number(targetWords.report) : 3500
-const synthWords = Number(targetWords.synthesis) > 0 ? Number(targetWords.synthesis) : 6000
+const reportWords = Number(targetWords.report) > 0 ? Number(targetWords.report) : DEFAULT_WORDS.report
+const synthWords = Number(targetWords.synthesis) > 0 ? Number(targetWords.synthesis) : DEFAULT_WORDS.synthesis
 
 const perim = engine.perimeter || {}
 const joinList = (v, empty) => {
@@ -128,16 +122,22 @@ const joinList = (v, empty) => {
 }
 
 const missionText = String(engine.mission || '').trim()
-if (!missionText) die('в engine.json пустая mission. Она вставляется дословно в каждый промпт: без неё агенты работают вслепую. Заполни 3-6 предложений и повтори рендер.')
-// engine-init кладёт в mission заглушку «ЗАПОЛНИТЬ...» — в промпт она уйдёт дословно и агент получит инструкцию вместо задачи
-if (/^ЗАПОЛНИТЬ/i.test(missionText)) die('в engine.json вместо mission стоит заглушка engine-init («' + missionText.slice(0, 40) + '…»). Она уйдёт в каждый промпт дословно. Напиши 3-6 предложений: что за движок, кому и для какой работы, — и повтори рендер.')
+const brief = normalizeBrief(engine.brief)
+// Разведка идёт до вопросов заказчику, когда миссии ещё нет: её задача опирается на исходный запрос.
+if (STAGE === 'recon') {
+  if (!brief.request && !brief.restated) die('для разведки нужен исходный запрос: brief.request в engine.json пуст. Заведи движок с --request "<запрос дословно>" или впиши его в brief.request.')
+} else {
+  if (!missionText) die('в engine.json пустая mission. Она вставляется дословно в каждый промпт: без неё агенты работают вслепую. Заполни 3-6 предложений и повтори рендер.')
+  // engine-init кладёт в mission заглушку «ЗАПОЛНИТЬ...» — в промпт она уйдёт дословно и агент получит инструкцию вместо задачи
+  if (MISSION_STUB_RE.test(missionText)) die('в engine.json вместо mission стоит заглушка engine-init («' + missionText.slice(0, 40) + '…»). Она уйдёт в каждый промпт дословно. Напиши 3-6 предложений: что за движок, кому и для какой работы, — и повтори рендер.')
+}
 
 // ---------------------------------------------------------------- пути и списки
 
 const reportPath = (slug) => path.join(ROOT, 'reports', slug + '.md')
 const promptPath = (slug) => path.join(ROOT, 'prompts', slug + '.md')
 const specPath = (label) => path.join(ROOT, 'synthesis-spec', label + '.md')
-const synthFile = (s) => path.join(ROOT, 'synthesis', String(s.file || String(s.label).toUpperCase() + '.md'))
+const synthFile = (s) => path.join(ROOT, 'synthesis', synthFileName(s))
 const taskPath = (label) => path.join(ROOT, 'state', 'tasks', label + '.md')
 const resultPath = (label) => path.join(ROOT, 'state', 'results', label + '.json')
 
@@ -178,30 +178,45 @@ const COMMON = {
   ROOT,
   SLUG: String(engine.slug || path.basename(ROOT)),
   TITLE: String(engine.title || engine.slug || path.basename(ROOT)),
-  TODAY: String(engine.today || engine.createdAt || ''),
+  // «Сегодня» в промпте — дата рендера, а не дата заведения движка: агент по ней решает,
+  // что устарело, и ею подписывает раздел «## Верификация». Движок, продолженный через
+  // месяц, иначе получает в промптах прошлое число.
+  TODAY: argv.today || todayISO(),
   LANGUAGE: String(engine.language || 'ru'),
   MISSION: missionText,
   PERIMETER_IN: joinList(perim.in, 'периметр не задан — заполни perimeter.in в engine.json'),
   PERIMETER_OUT: joinList(perim.out, 'исключения не заданы — заполни perimeter.out в engine.json'),
   PROFILE: String(engine.profile || 'M'),
-  FINISH: String(engine.finish || 'method'),
+  FINISH: String(engine.finish || DEFAULT_FINISH),
   CORPUS_SIZE,
   ALL_REPORTS,
   ALL_SYNTHESIS,
+  // бриф (references/BRIEF.md): работа базы, контрольные вопросы, материалы заказчика, политика источников
+  // Разведка идёт параллельно разговору с заказчиком: всё, что уже решено, обязано до неё доехать,
+  // иначе она заново предлагает выбор, который заказчик уже сделал.
+  REQUEST: [
+    brief.request ? 'Дословно: «' + brief.request + '»' : '',
+    brief.restated ? 'Как его поняли: ' + brief.restated : '',
+    brief.constraints.length ? '**Уже решено с заказчиком — не предлагай заново:**\n' + brief.constraints.map(x => '- ' + x).join('\n') : '',
+    brief.assumptions.length ? '**Допущения** (неподтверждённые помечены — их можно проверить и оспорить):\n' + brief.assumptions.map(x => '- ' + x).join('\n') : '',
+  ].filter(Boolean).join('\n\n'),
+  JOBS: jobsText(brief),
+  ACCEPTANCE_LIST: acceptanceText(brief.acceptance, 'контрольные вопросы в брифе не заданы — готовность базы мерить нечем, отметь это как риск'),
+  INPUTS_LIST: inputsText(brief, ROOT),
+  SOURCES_POLICY: sourcesText(brief),
 }
-if (!COMMON.TODAY) die('в engine.json нет поля today (дата сборки). Промпты без даты разрешают агенту опираться на устаревшую память — поставь дату и повтори рендер.')
+
+// контрольные вопросы, ради которых заведены темы: topics[].answers → вопросы брифа
+const acceptanceById = new Map(brief.acceptance.map(a => [a.id, a]))
+const acceptanceOf = (slugs) => {
+  const ids = [...new Set(slugs.flatMap(sl => strList((topicBySlug.get(sl) || {}).answers)))]
+  return ids.map(id => acceptanceById.get(id)).filter(Boolean)
+}
+const NO_TOPIC_ACCEPTANCE = 'тема не привязана к контрольным вопросам брифа (topics[].answers пуст) — работай по вопросам ТЗ и держи в голове работу базы выше'
 
 // ---------------------------------------------------------------- банк фактов частями
 
-const isBankPart = (s) => /^FACTS-BANK-/i.test(String(s.file || ''))
-// GAPS.md стоит в syntheses как файл движка, но пишет его стадия critique — стадии synth он не задача
-const isGaps = (s) => /^GAPS\.md$/i.test(String(s.file || '')) || String(s.label) === 'gaps'
-const bankEntry = syntheses.find(s => String(s.label) === 'facts-bank' || /^FACTS-BANK\.md$/i.test(String(s.file || '')))
-const declaredParts = bankEntry
-  ? [...(Array.isArray(bankEntry.primary) ? bankEntry.primary : []), ...(Array.isArray(bankEntry.parts) ? bankEntry.parts : [])]
-      .map(String).map(l => syntheses.find(s => String(s.label) === l)).filter(Boolean)
-  : []
-const bankParts = declaredParts.length ? declaredParts : syntheses.filter(isBankPart)
+const { entry: bankEntry, parts: bankParts } = bankLayout(syntheses)
 
 // ---------------------------------------------------------------- сборка задач стадии
 
@@ -216,6 +231,7 @@ function topicTasks(prefix) {
       PROMPT_PATH: promptPath(t.slug),
       REPORT_PATH: reportPath(t.slug),
       TARGET_WORDS: String(reportWords),
+      TOPIC_ACCEPTANCE: acceptanceText(acceptanceOf([String(t.slug)]), NO_TOPIC_ACCEPTANCE),
     },
     needs: prefix === 'research'
       ? [{ p: promptPath(t.slug), what: 'ТЗ ресерча' }]
@@ -225,7 +241,8 @@ function topicTasks(prefix) {
 
 function synthTasks() {
   if (!syntheses.length) die('в engine.json нет сводов: рендерить нечего. Спроектируй состав сводов и внеси их в syntheses.')
-  const list = syntheses.filter(s => !(bankParts.length && bankEntry && s === bankEntry) && !isGaps(s))
+  // тот же набор, что видит fanout.mjs: без GAPS.md и без навигатора банка, собранного частями
+  const list = synthStageEntries(syntheses)
   if (!list.length) die('на стадии synth рендерить нечего: в syntheses остались только навигатор банка фактов (его собирает стадия merge) и GAPS.md (его пишет стадия critique).')
   return list.map(s => {
     const label = String(s.label)
@@ -249,6 +266,7 @@ function synthTasks() {
         PRIMARY_LIST: primary.map(x => reportLine(topicBySlug.get(x))).join('\n'),
         SECONDARY_LIST: listOr(secondary.map(x => reportLine(topicBySlug.get(x))), 'периферии нет: весь относящийся корпус уже в обязательных'),
         OTHER_LIST: listOr(topics.filter(t => !inUse.has(String(t.slug))).map(reportLine), 'остального корпуса нет: свод опирается на все темы движка'),
+        TOPIC_ACCEPTANCE: acceptanceText(acceptanceOf([...primary, ...secondary]), 'твои отчёты не привязаны к контрольным вопросам брифа — переноси по ТЗ свода'),
       },
       needs: [{ p: specPath(label), what: 'ТЗ на свод' }],
     }
@@ -260,6 +278,14 @@ function singleTask(label, values, needs) {
 }
 
 function buildTasks() {
+  if (STAGE === 'recon') {
+    return singleTask('recon__field', {
+      OUT_PATH: path.join(ROOT, 'brief', 'RECON.md'),
+      TARGET_WORDS: '1500',
+      // миссии на разведке ещё нет: первый круг вопросов о работе базы идёт параллельно
+      JOBS: jobsText(brief, 'работа базы ещё выясняется — первый круг вопросов заказчику идёт параллельно с тобой; варианты работ предложи в разделе 6'),
+    })
+  }
   if (STAGE === 'research') return topicTasks('research')
   if (STAGE === 'verify') return topicTasks('verify')
   if (STAGE === 'synth') return synthTasks()
@@ -298,7 +324,7 @@ function buildTasks() {
 
 let tasks = buildTasks()
 
-if (STAGE !== 'research' && STAGE !== 'verify' && STAGE !== 'synth' && String(engine.finish || 'method') === 'base' && (STAGE === 'method' || STAGE === 'agent-doc')) {
+if ((STAGE === 'method' || STAGE === 'agent-doc') && String(engine.finish || DEFAULT_FINISH) === 'base') {
   console.error('Предупреждение: у движка finish = base — конвейер задуман с остановом после GAPS.md. Стадия ' + STAGE + ' рендерится, но убедись, что это осознанное решение.')
 }
 
@@ -359,6 +385,7 @@ if (emptyPerim.length) warnings.push('в engine.json пусто поле ' + emp
 
 const FS_HINT = '\nПроверь права на каталог state/tasks и что --root ведёт в каталог движка.'
 
+let toolchain = []
 if (!argv.dryRun) {
   // state/results заводим здесь же: путь результата уходит в промпт, а записывает его агент —
   // если каталога нет, агент упирается в ENOENT последним действием, когда работа уже сделана.
@@ -366,6 +393,11 @@ if (!argv.dryRun) {
     try { fs.mkdirSync(d, { recursive: true }) }
     catch (e) { die('не удалось создать каталог ' + d + ': ' + e.message + FS_HINT) }
   }
+  // Исполнитель запускается из копии в корне движка — она обязана совпадать со скиллом.
+  try { toolchain = syncToolchain(ROOT, SKILL) }
+  catch (e) { die('не удалось обновить копии исполнителей и схем в ' + ROOT + ': ' + e.message + FS_HINT) }
+} else {
+  toolchain = toolchainDrift(ROOT, SKILL).map(d => d.rel + (d.state === 'missing' ? ' (будет добавлен)' : ' (будет обновлён)'))
 }
 
 for (const task of tasks) {
@@ -414,17 +446,31 @@ if (skipped.length && !argv.force) {
   console.log('Не тронуто файлов: ' + skipped.length + '. Перерендерить поверх — повтори с --force (это нужно всегда, когда правил mission, периметр или состав тем).')
 }
 
+if (toolchain.length) {
+  console.log('')
+  console.log('Копии исполнителей и схем в движке ' + (argv.dryRun ? 'отстают от скилла' : 'приведены к версии скилла') + ': ' + toolchain.join(', '))
+}
+
 if (warnings.length) {
   console.log('')
   console.log('Предупреждения (задача отрендерена, но агенту нечего будет читать):')
   for (const w of warnings) console.log('  · ' + w)
 }
 
+const script = (name) => path.join(SKILL, 'scripts', name)
+const afterBatch = 'После партии: node ' + script('status.mjs') + ' --root ' + ROOT +
+  ' --write (статусы тем и сводов, строка в state/run-log.md), затем node ' + script('audit.mjs') + ' --root ' + ROOT + '.'
+const codexRun = 'node ' + script('fanout.mjs') + ' --root ' + ROOT + ' --stage ' + STAGE + ' --engine codex --concurrency 3'
+
 console.log('')
 if (argv.dryRun) {
   console.log('Дальше: повтори без --dry-run, чтобы записать файлы задач.')
-} else if (STAGE === 'research' || STAGE === 'verify') {
-  console.log('Дальше: партия 3-4 задачи — Workflow ' + ROOT + '/workflows/research.mjs с labels из колонки label (без префикса стадии), либо node ' + path.join(SKILL, 'scripts', 'fanout.mjs') + ' --root ' + ROOT + ' --stage ' + STAGE + ' --engine codex --concurrency 3. После партии: audit.mjs и строка в state/run-log.md.')
+} else if (STAGE === 'recon') {
+  console.log('Дальше: Workflow ' + ROOT + '/workflows/synthesis.mjs с args.stage = "recon" и args.labels = ["field"] (один агент, можно effort "medium"), либо ' + codexRun + '. Пока он идёт — первый круг вопросов заказчику о работе базы (references/BRIEF.md §3). Потом: прочитай brief/RECON.md, второй круг вопросов, заполни brief в engine.json и node ' + script('brief.mjs') + ' --root ' + ROOT + ' --write.')
+} else if (STAGE === 'research') {
+  console.log('Дальше: партия 3-4 темы — Workflow ' + ROOT + '/workflows/research.mjs с args.labels из колонки label (префикс стадии можно не писать; верификатор идёт следом сам), либо ' + codexRun + '. ' + afterBatch)
+} else if (STAGE === 'verify') {
+  console.log('Дальше: Workflow ' + ROOT + '/workflows/research.mjs с args.stage = "verify" — только верификатор, отчёт не пишется заново; либо ' + codexRun + '. ' + afterBatch)
 } else {
-  console.log('Дальше: партия 3-4 задачи — Workflow ' + ROOT + '/workflows/synthesis.mjs с stage ' + STAGE + ' и labels из колонки label, либо node ' + path.join(SKILL, 'scripts', 'fanout.mjs') + ' --root ' + ROOT + ' --stage ' + STAGE + ' --engine codex --concurrency 3. После партии: audit.mjs и строка в state/run-log.md.')
+  console.log('Дальше: партия 3-4 задачи — Workflow ' + ROOT + '/workflows/synthesis.mjs с args.stage = "' + STAGE + '" и args.labels из колонки label, либо ' + codexRun + '. ' + afterBatch)
 }
