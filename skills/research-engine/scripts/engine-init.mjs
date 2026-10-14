@@ -6,6 +6,11 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  die, isDir, isFile, readText, todayISO, isISODate, plural,
+  defaultSynthFile, isGaps, isBankNav, PROFILE_NORM, DEFAULT_FINISH, DEFAULT_WORDS,
+  strList, normalizeBrief, briefFindings, renderBriefMd,
+} from './lib/engine.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const SKILL = path.resolve(HERE, '..')            // корень скилла: .../skills/research-engine
@@ -17,6 +22,7 @@ const USAGE = `engine-init.mjs — заводит каркас движка ре
 
   node engine-init.mjs --root <path> --slug <slug> [--title "..."] [--profile S|M|L]
                        [--finish base|method] [--language ru] [--today YYYY-MM-DD]
+                       [--request "<исходный запрос дословно>"]
                        [--from <answers.json>] [--force] [--dry-run]
 
   --root      каталог движка. Обязателен (или root в answers.json).
@@ -26,6 +32,8 @@ const USAGE = `engine-init.mjs — заводит каркас движка ре
   --finish    base (останов после GAPS.md) | method (плюс METHOD.md и AGENT.md, по умолчанию)
   --language  язык корпуса, по умолчанию ru
   --today     дата сборки YYYY-MM-DD, по умолчанию сегодняшняя
+  --request   исходный запрос заказчика дословно — первая строка брифа (brief.request).
+              С него начинается стадия брифа: разведка, вопросы, контрольные вопросы базы.
   --from      answers.json с итогами интейка; флаги командной строки перекрывают его поля
   --force     перезаписать существующие файлы (engine.json сначала уедет в .bak-<дата>)
   --dry-run   напечатать план и не писать ничего
@@ -34,39 +42,25 @@ const USAGE = `engine-init.mjs — заводит каркас движка ре
 answers.json — объект с любым подмножеством полей engine.json:
   root, slug, title, language, profile, finish, today, mission,
   perimeter { in: [...], out: [...] }, targetWords { report, synthesis },
-  topics [ { slug, title, what, feeds:[label], status } ],
+  brief { request, restated, users, jobs, decisions, deliverables,
+          acceptance:[{ id, question, job }], assumptions, constraints, known,
+          inputs:[{ ref, kind, use, trust }], sources { must, avoid }, freshness, openQuestions },
+  topics [ { slug, title, what, feeds:[label], answers:[A1], status } ],
   syntheses [ { label, file, title, primary:[slug], secondary:[slug], status } ]
 
 Что создаётся: дерево prompts/ reports/ synthesis-spec/ synthesis/ workflows/ schemas/
-state/{tasks,results,logs}, файлы engine.json, ENGINE.md, prompts/README.md,
-state/run-log.md и копии исполнителей и схем из скилла.`
+inputs/ brief/ state/{tasks,results,logs}, файлы engine.json, ENGINE.md, BRIEF.md,
+prompts/README.md, state/run-log.md и копии исполнителей и схем из скилла.`
 
-const PROFILES = ['S', 'M', 'L']
+const PROFILES = Object.keys(PROFILE_NORM)
 const FINISHES = ['base', 'method']
-
-// ---------------------------------------------------------------- утилиты
-
-function die(msg, code = 2) {
-  console.error('Ошибка: ' + msg)
-  process.exit(code)
-}
-
-function isDir(p) { try { return fs.statSync(p).isDirectory() } catch { return false } }
-function isFile(p) { try { return fs.statSync(p).isFile() } catch { return false } }
-function readText(p) { try { return fs.readFileSync(p, 'utf8') } catch { return null } }
-
-function todayISO() {
-  const d = new Date()
-  const p = (n) => String(n).padStart(2, '0')
-  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate())
-}
 
 // ---------------------------------------------------------------- аргументы
 
 function parseArgs(argv) {
   const out = {
     root: '', slug: '', title: '', profile: '', finish: '', language: '',
-    today: '', from: '', force: false, dryRun: false,
+    today: '', from: '', request: '', force: false, dryRun: false,
   }
   const take = (name, i) => {
     const v = argv[i + 1]
@@ -94,7 +88,7 @@ function parseArgs(argv) {
 function applyFlag(out, key, value, raw) {
   const map = {
     root: 'root', slug: 'slug', title: 'title', profile: 'profile',
-    finish: 'finish', language: 'language', today: 'today', from: 'from',
+    finish: 'finish', language: 'language', today: 'today', from: 'from', request: 'request',
   }
   const field = map[key]
   if (!field) die('неизвестный аргумент ' + raw + '\n\n' + USAGE)
@@ -116,16 +110,10 @@ function loadAnswers(file) {
 
 const KNOWN_ANSWER_KEYS = new Set([
   'root', 'slug', 'title', 'language', 'profile', 'finish', 'today', 'createdAt',
-  'mission', 'perimeter', 'targetWords', 'topics', 'syntheses', 'version', 'runs',
+  'mission', 'perimeter', 'targetWords', 'topics', 'syntheses', 'version', 'runs', 'brief',
 ])
 
 // ---------------------------------------------------------------- нормализация состояния
-
-function strList(v) {
-  if (!v) return []
-  const arr = Array.isArray(v) ? v : [v]
-  return arr.map(x => String(x).trim()).filter(Boolean)
-}
 
 function normTopics(raw, warns) {
   if (!raw) return []
@@ -142,14 +130,12 @@ function normTopics(raw, warns) {
       title: String(t.title || slug),
       what: String(t.what || ''),
       feeds: strList(t.feeds),
+      // id контрольных вопросов брифа, ради которых тема заведена
+      answers: strList(t.answers),
       status: ['planned', 'researched', 'verified'].includes(t.status) ? t.status : 'planned',
     })
   }
   return out
-}
-
-function defaultFile(label) {
-  return String(label).toUpperCase().replace(/[^A-Z0-9]+/g, '-').replace(/^-+|-+$/g, '') + '.md'
 }
 
 function normSyntheses(raw, warns) {
@@ -164,7 +150,7 @@ function normSyntheses(raw, warns) {
     seen.add(label)
     out.push({
       label,
-      file: String(s.file || defaultFile(label)),
+      file: String(s.file || defaultSynthFile(label)),
       title: String(s.title || label),
       primary: strList(s.primary),
       secondary: strList(s.secondary),
@@ -256,11 +242,11 @@ if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) die('слаг «' + slug + '» не го
 const profile = String(argv.profile || answers.profile || 'M').toUpperCase()
 if (!PROFILES.includes(profile)) die('--profile принимает S | M | L, получено: ' + profile)
 
-const finish = String(argv.finish || answers.finish || 'method')
+const finish = String(argv.finish || answers.finish || DEFAULT_FINISH)
 if (!FINISHES.includes(finish)) die('--finish принимает base | method, получено: ' + finish)
 
 const today = String(argv.today || answers.today || todayISO())
-if (!/^\d{4}-\d{2}-\d{2}$/.test(today)) die('--today ждёт дату в формате YYYY-MM-DD, получено: ' + today)
+if (!isISODate(today)) die('--today ждёт дату в формате YYYY-MM-DD, получено: ' + today)
 
 const language = String(argv.language || answers.language || 'ru')
 const title = String(argv.title || answers.title || slug)
@@ -273,12 +259,31 @@ const perimeterOut = strList(answers.perimeter && answers.perimeter.out)
 
 const tw = answers.targetWords || {}
 const targetWords = {
-  report: Number.isFinite(Number(tw.report)) && Number(tw.report) > 0 ? Number(tw.report) : 3500,
-  synthesis: Number.isFinite(Number(tw.synthesis)) && Number(tw.synthesis) > 0 ? Number(tw.synthesis) : 6000,
+  report: Number.isFinite(Number(tw.report)) && Number(tw.report) > 0 ? Number(tw.report) : DEFAULT_WORDS.report,
+  synthesis: Number.isFinite(Number(tw.synthesis)) && Number(tw.synthesis) > 0 ? Number(tw.synthesis) : DEFAULT_WORDS.synthesis,
 }
 
 const topics = normTopics(answers.topics, warns)
 const syntheses = normSyntheses(answers.syntheses, warns)
+
+// Бриф: исходный запрос дословно и всё, что выяснено на интейке (references/BRIEF.md).
+// id контрольных вопросов фиксируются сразу, чтобы topics[].answers ссылались на стабильные метки.
+const briefRaw = answers.brief && typeof answers.brief === 'object' && !Array.isArray(answers.brief) ? answers.brief : {}
+if (answers.brief && briefRaw !== answers.brief) warns.push('поле brief в answers.json не объект — бриф пропущен')
+const nb = normalizeBrief({ ...briefRaw, request: argv.request || briefRaw.request })
+const brief = {
+  request: nb.request, restated: nb.restated, users: nb.users, jobs: nb.jobs,
+  decisions: nb.decisions, deliverables: nb.deliverables,
+  acceptance: nb.acceptance.map(({ id, question, job }) => ({ id, question, job })),
+  assumptions: nb.assumptions, constraints: nb.constraints, known: nb.known,
+  inputs: nb.inputs, sources: nb.sources, freshness: nb.freshness, openQuestions: nb.openQuestions,
+}
+const acceptanceIds = new Set(brief.acceptance.map(a => a.id))
+for (const t of topics) {
+  for (const id of t.answers) {
+    if (!acceptanceIds.has(id)) warns.push('тема ' + t.slug + ' отвечает на контрольный вопрос ' + id + ', которого нет в brief.acceptance')
+  }
+}
 
 // Матрицу «тема → свод» проверяем здесь, а не на рендере задач: битая ссылка, найденная
 // после ресерча, стоит целой партии агентов.
@@ -291,10 +296,8 @@ for (const t of topics) {
   if (!t.feeds.length && syntheses.length) warns.push('тема ' + t.slug + ' не питает ни один свод — либо назначь ей свод в feeds, либо выкинь тему')
   if (!t.what) warns.push('у темы ' + t.slug + ' пустое поле what — эта строка идёт в списки отчётов внутри промптов, агент по ней решает, что читать')
 }
-// GAPS.md стоит в syntheses как файл движка, но пишет его стадия critique — primary ему не нужен.
-// Навигатор банка фактов, собранного частями, ссылается в primary на метки частей, а не на темы.
-const isGaps = (s) => /^GAPS\.md$/i.test(s.file) || s.label === 'gaps'
-const isBankNav = (s) => /^FACTS-BANK\.md$/i.test(s.file) || s.label === 'facts-bank'
+// GAPS.md пишет стадия critique — primary ему не нужен. Навигатор банка фактов, собранного
+// частями, ссылается в primary на метки частей, а не на темы. Роли — в lib/engine.mjs.
 for (const s of syntheses) {
   if (isGaps(s)) continue
   for (const p of [...s.primary, ...s.secondary]) {
@@ -305,12 +308,10 @@ for (const s of syntheses) {
   if (!s.primary.length) warns.push('у свода ' + s.label + ' пустой primary — наполнять его будет нечем')
 }
 
-const NORM = { S: [5, 6, 3, 4], M: [8, 10, 6, 9], L: [13, 16, 6, 12] }
 if (topics.length) {
-  const [tMin, tMax, sMin, sMax] = NORM[profile]
+  const [tMin, tMax, sMin, sMax] = PROFILE_NORM[profile]
   if (topics.length < tMin || topics.length > tMax) warns.push('профиль ' + profile + ' рассчитан на ' + tMin + '-' + tMax + ' тем, в answers.json их ' + topics.length + ' — поменяй профиль или состав тем')
-  const sWord = sMax >= 2 && sMax <= 4 ? ' свода' : ' сводов'
-  if (syntheses.length && (syntheses.length < sMin || syntheses.length > sMax)) warns.push('профиль ' + profile + ' рассчитан на ' + sMin + '-' + sMax + sWord + ', в answers.json их ' + syntheses.length)
+  if (syntheses.length && (syntheses.length < sMin || syntheses.length > sMax)) warns.push('профиль ' + profile + ' рассчитан на ' + sMin + '-' + sMax + ' ' + plural(sMax, 'свод', 'свода', 'сводов') + ', в answers.json их ' + syntheses.length)
 }
 
 // проверка шаблонов до первой записи: половинчатый каркас хуже, чем ни одного
@@ -369,6 +370,7 @@ const engineJson = {
   today,
   mission,
   perimeter: { in: perimeterIn, out: perimeterOut },
+  brief,
   targetWords,
   topics,
   syntheses,
@@ -398,6 +400,8 @@ const opt = { force: argv.force, dryRun: argv.dryRun }
 const DIRS = [
   'prompts', 'reports', 'synthesis-spec', 'synthesis',
   'workflows', 'schemas',
+  'inputs', // материалы заказчика: файлы, выгрузки, прошлые наработки — перечисляются в brief.inputs
+  'brief',  // разведка предмета (brief/RECON.md) и рабочие файлы стадии брифа; в корпус не входит
   path.join('state', 'tasks'), path.join('state', 'results'), path.join('state', 'logs'),
 ]
 
@@ -427,6 +431,7 @@ for (const src of [enginePath, runLogPath]) {
 
 planWrite(enginePath, JSON.stringify(engineJson, null, 2) + '\n', opt)
 planWrite(path.join(ROOT, 'ENGINE.md'), render(readText(tplEngine), values, tplEngine), opt)
+planWrite(path.join(ROOT, 'BRIEF.md'), renderBriefMd(engineJson, ROOT, topics), opt)
 planWrite(path.join(ROOT, 'prompts', 'README.md'), render(readText(tplReadme), values, tplReadme), opt)
 planWrite(runLogPath, runLog, opt)
 
@@ -469,8 +474,12 @@ if (warns.length) {
 }
 
 const todo = []
-if (mission === MISSION_STUB) todo.push('заполни `mission` в engine.json — она дословно уходит в каждый промпт')
-if (!perimeterIn.length || !perimeterOut.length) todo.push('заполни `perimeter.in` и `perimeter.out` — периметр без списка исключений не удерживает агентов')
+const bf = briefFindings(engineJson, ROOT)
+if (bf.blockers.length) {
+  todo.push('стадия брифа по references/BRIEF.md: разбор запроса, разведка (render-tasks --stage recon), вопросы заказчику о работе базы, материалы в inputs/, контрольные вопросы. Не закрыто пунктов: ' +
+    bf.blockers.length + ' — список печатает node ' + path.join(SKILL, 'scripts', 'brief.mjs') + ' --root ' + ROOT)
+  todo.push('покажи BRIEF.md пользователю — точка останова: без утверждённого брифа декомпозицию не начинаем')
+}
 if (!topics.length) todo.push('разрежь тему на ТЗ: `prompts/<NN-slug>.md` по `templates/prompt.tmpl.md`, темы — в `topics` engine.json')
 if (!syntheses.length) todo.push('спроектируй своды: `synthesis-spec/<label>.md` по `templates/synthesis-spec.tmpl.md`, своды — в `syntheses` engine.json')
 
@@ -481,7 +490,7 @@ for (const t of todo) console.log('  ' + (++n) + '. ' + t)
 console.log('  ' + (++n) + '. покажи пользователю периметр и карту тем — это точка останова, дальше без подтверждения не идём')
 console.log('  ' + (++n) + '. node ' + path.join(SKILL, 'scripts', 'render-tasks.mjs') + ' --root ' + ROOT + ' --stage research')
 console.log('  ' + (++n) + '. прогон партией 3-4 задачи: Workflow ' + ROOT + '/workflows/research.mjs (Claude Code) или node ' + path.join(SKILL, 'scripts', 'fanout.mjs') + ' --root ' + ROOT + ' --stage research --engine codex')
-console.log('  ' + (++n) + '. после каждой партии: node ' + path.join(SKILL, 'scripts', 'audit.mjs') + ' --root ' + ROOT + ' и строка в state/run-log.md')
+console.log('  ' + (++n) + '. после каждой партии: node ' + path.join(SKILL, 'scripts', 'status.mjs') + ' --root ' + ROOT + ' --write (статусы и строка в state/run-log.md), затем node ' + path.join(SKILL, 'scripts', 'audit.mjs') + ' --root ' + ROOT)
 
 if (plan.kept.length && !opt.force) {
   console.log('')

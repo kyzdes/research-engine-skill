@@ -1,8 +1,9 @@
 export const meta = {
   name: 'research-engine-synthesis',
-  description: 'Стадии свода движка: своды по отчётам, навигатор банка фактов, критик полноты, METHOD.md и AGENT.md — каждая партия агентов работает по своим файлам задач',
-  whenToUse: 'После того как отчёты собраны и верифицированы, а render-tasks.mjs отрендерил задачи нужной стадии. args: { root: "/abs/path/<slug>-engine", labels: ["field-spec", "verdicts"], stage?: "synth" | "merge" | "critique" | "method" | "agent-doc", effort?: "high", schemas?: {} }. Стадия выбирает и вид задачи, и схему возврата. Партия — 3-4 задачи за вызов.',
+  description: 'Стадии движка, где агент пишет один файл: разведка предмета для брифа, своды по отчётам, навигатор банка фактов, критик полноты, METHOD.md и AGENT.md — каждая партия агентов работает по своим файлам задач',
+  whenToUse: 'После того как отчёты собраны и верифицированы, а render-tasks.mjs отрендерил задачи нужной стадии. args: { root: "/abs/path/<slug>-engine", labels: ["field-spec", "verdicts"], stage?: "recon" | "synth" | "merge" | "critique" | "method" | "agent-doc", effort?: "high", model?: "<id>", schemas?: {} }. Стадия выбирает и вид задачи, и схему возврата. Партия — 3-4 задачи за вызов.',
   phases: [
+    { title: 'Recon', detail: 'разведка предмета до второго круга вопросов заказчику: brief/RECON.md' },
     { title: 'Synthesize', detail: 'своды в synthesis/: каждый агент читает state/tasks/synth__<label>.md и полные отчёты' },
     { title: 'Merge', detail: 'навигатор поверх частей банка фактов; части остаются данными' },
     { title: 'Critique', detail: 'критик полноты сверяет отчёты со сводами и пишет GAPS.md' },
@@ -48,18 +49,27 @@ const GAPS_SCHEMA = OVERRIDE.gaps || {
     holes: { type: 'array', items: { type: 'string' }, description: 'дыры фактуры: вопросы, на которые ресерч не ответил; каждый — с формулировкой follow-up запроса' },
     risks: { type: 'array', items: { type: 'string' }, description: 'риски: где движок может навредить пользователю или увести к ложному выводу' },
     blockers: { type: 'array', items: { type: 'string' }, description: 'блокеры финиша: что обязано быть закрыто до METHOD.md; пустой массив при вердикте ready' },
+    acceptance: { type: 'array', items: { type: 'string' }, description: 'контрольные вопросы брифа: по строке на вопрос — «A1 — отвечено | частично | нет — адрес ответа или чего не хватает»; пустой массив, если вопросов в брифе нет' },
   },
-  required: ['path', 'verdict', 'losses', 'holes', 'risks', 'blockers'],
+  required: ['path', 'verdict', 'losses', 'holes', 'risks', 'blockers', 'acceptance'],
 }
 
 const STAGES = {
+  recon: {
+    prefix: 'recon__',
+    phase: 'Recon',
+    example: 'field',
+    alias: { recon: 'field' },
+    role: 'Ты разведчик движка на стадии брифа. Движок ещё не собран: тема не разрезана, миссия не написана. Твоя работа — за один проход карта предмета с первоисточниками, кандидаты в работы базы и в контрольные вопросы и вопросы заказчику, ответ на которые меняет сборку. Ширина и точные названия важнее глубины: глубину даст конвейер. Тебе нужен веб-поиск.',
+    next: 'Дальше: прочитай brief/RECON.md, задай заказчику второй круг вопросов (references/BRIEF.md §4), заполни brief в engine.json и node $SKILL/scripts/brief.mjs --root ROOT --write.',
+  },
   synth: {
     prefix: 'synth__',
     phase: 'Synthesize',
     example: 'field-spec',
     alias: {},
     role: 'Ты сводчик движка. Твой свод — надмножество относящихся к нему отчётов, а не их пересказ: таблицы, цифры и дословные примеры переносятся целиком. Дедупликация допустима только для дословных повторов между источниками и всегда с пометкой «подтверждено N отчётами». Метод чтения корпуса задан в файле задачи — держись его: свои отчёты читаются целиком, чужие точечно.',
-    next: 'Дальше: следующая партия сводов (synthesis.mjs с другими args.labels), потом node scripts/audit.mjs --root ROOT --stage synthesis, потом стадия merge или сразу critique.',
+    next: 'Дальше: следующая партия сводов (synthesis.mjs с другими args.labels); после последней — node $SKILL/scripts/audit.mjs --root ROOT --stage synthesis, потом стадия merge, если банк фактов собран частями, иначе сразу critique.',
   },
   merge: {
     prefix: 'merge__',
@@ -67,7 +77,7 @@ const STAGES = {
     example: 'facts-bank',
     alias: { merge: 'facts-bank', bank: 'facts-bank' },
     role: 'Ты собираешь навигатор поверх частей, которые уже лежат на диске. Переписывать части в один файл нельзя: ручной перенос тысяч строк таблиц гарантированно теряет данные, и агент начинает сокращать. Части остаются самими данными, твой файл — вход в них: как читать, карта разделов с объёмами, опорные числа со ссылкой на полную строку, сводный список противоречий.',
-    next: 'Дальше: node scripts/render-tasks.mjs --root ROOT --stage critique и synthesis.mjs со stage critique.',
+    next: 'Дальше: node $SKILL/scripts/render-tasks.mjs --root ROOT --stage critique и synthesis.mjs со stage critique.',
   },
   critique: {
     prefix: 'critique__',
@@ -75,7 +85,7 @@ const STAGES = {
     example: 'gaps',
     alias: { critique: 'gaps' },
     role: 'Ты критик полноты, ревизор, а не редактор. Читай корпус по правилам ревизии: оглавления через grep по строкам-заголовкам, вводные правила и разделы про пробелы — целиком, вглубь ныряй точечно под конкретную претензию. Ищи то, где движок слабее, чем кажется: потери конвейера, дыры фактуры, места, где агент по этим документам встанет, риски и честную границу применимости. Придирчивость здесь — работа, а не грубость.',
-    next: 'Дальше: прочитать GAPS.md и закрыть блокеры. При finish base на этом стоп; при finish method — render-tasks.mjs --stage method и synthesis.mjs со stage method.',
+    next: 'Дальше: прочитать GAPS.md и закрыть блокеры. При finish base на этом стоп; при finish method — node $SKILL/scripts/render-tasks.mjs --root ROOT --stage method и synthesis.mjs со stage method.',
   },
   method: {
     prefix: 'method__',
@@ -83,7 +93,7 @@ const STAGES = {
     example: 'method',
     alias: { 'METHOD.md': 'method' },
     role: 'Ты пишешь главный документ движка: навигатор и свод законов, а не пересказ сводов. Закон формулируется как правило действия, а не наблюдение, и снабжается ссылкой на файл свода, где лежит доказательство. Своды целиком не читай — метод чтения задан в файле задачи. Тон плотный и инструктивный, без канцелярита и общих слов.',
-    next: 'Дальше: render-tasks.mjs --stage agent-doc и synthesis.mjs со stage agent-doc.',
+    next: 'Дальше: node $SKILL/scripts/render-tasks.mjs --root ROOT --stage agent-doc и synthesis.mjs со stage agent-doc.',
   },
   'agent-doc': {
     prefix: 'method__',
@@ -91,7 +101,7 @@ const STAGES = {
     example: 'agent',
     alias: { 'agent-doc': 'agent', 'AGENT.md': 'agent' },
     role: 'Ты пишешь вход для агента, который будет работать по движку: что прочитать и когда, в каком порядке действовать, где остановиться и спросить человека, чего не делать никогда. Коротко и операционно. Содержание живёт в методике и сводах — дублировать его сюда не надо, надо дать точную навигацию по ним.',
-    next: 'Дальше: node scripts/build-index.mjs --root ROOT и финальный node scripts/audit.mjs --root ROOT --stage all.',
+    next: 'Дальше: node $SKILL/scripts/build-index.mjs --root ROOT и финальный node $SKILL/scripts/audit.mjs --root ROOT --stage all.',
   },
 }
 
@@ -103,10 +113,12 @@ if (!CFG) throw new Error('Неизвестная стадия: ' + STAGE + '. �
 
 const SCHEMA = STAGE === 'critique' ? GAPS_SCHEMA : FILE_SCHEMA
 const EFFORT = A.effort || 'high'
+// Модель не задана — агент наследует модель сессии; это почти всегда правильно.
+const MODEL = A.model ? String(A.model) : ''
 
 const raw = (Array.isArray(A.labels) ? A.labels : []).map(x => String(x).trim()).filter(Boolean)
 if (!raw.length) {
-  throw new Error('Пустой args.labels. Передай метки задач стадии ' + STAGE + ', например { root: "' + ROOT + '", stage: "' + STAGE + '", labels: ["' + CFG.example + '"] }. Метки стадии synth — поле label каждого свода в engine.json; у остальных стадий метка одна и канонична: merge → facts-bank, critique → gaps, method → method, agent-doc → agent. Файлы задач должны быть уже отрендерены: node scripts/render-tasks.mjs --root ' + ROOT + ' --stage ' + STAGE)
+  throw new Error('Пустой args.labels. Передай метки задач стадии ' + STAGE + ', например { root: "' + ROOT + '", stage: "' + STAGE + '", labels: ["' + CFG.example + '"] }. Метки стадии synth — поле label каждого свода в engine.json; у остальных стадий метка одна и канонична: recon → field, merge → facts-bank, critique → gaps, method → method, agent-doc → agent. Файлы задач должны быть уже отрендерены: node $SKILL/scripts/render-tasks.mjs --root ' + ROOT + ' --stage ' + STAGE + ' ($SKILL — каталог скилла research-engine)')
 }
 
 const seen = {}
@@ -130,7 +142,7 @@ phase(CFG.phase)
 log('Стадия ' + STAGE + ' · задач в партии: ' + tasks.length + ' — ' + tasks.map(t => t.label).join(', '))
 if (tasks.length > 4) log('Внимание: партия больше четырёх задач. Прошлый прогон девяти тяжёлых агентов разом сжёг лимит сессии за пять минут; безопасная партия — 3-4 задачи.')
 
-const out = await parallel(tasks.map(t => () => agent(prompt(t.label), { label: t.label, phase: CFG.phase, schema: SCHEMA, effort: EFFORT })))
+const out = await parallel(tasks.map(t => () => agent(prompt(t.label), Object.assign({ label: t.label, phase: CFG.phase, schema: SCHEMA, effort: EFFORT }, MODEL ? { model: MODEL } : {}))))
 
 const pairs = tasks.map((t, i) => ({ task: t, res: (out || [])[i] || null }))
 const done = pairs.filter(p => p.res)
@@ -146,6 +158,7 @@ const view = (p) => STAGE === 'critique'
       holes: p.res.holes || [],
       risks: p.res.risks || [],
       blockers: p.res.blockers || [],
+      acceptance: p.res.acceptance || [],
     }
   : {
       label: p.task.label,
@@ -162,14 +175,17 @@ const built = done.map(view)
 
 log('Готово файлов: ' + built.length + ' из ' + tasks.length + (failed.length ? ' · не собрались: ' + failed.join(', ') : ''))
 
+// Workflow не видит файловой системы: статусы сводов в engine.json и строку журнала ставит status.mjs.
+const status = 'node $SKILL/scripts/status.mjs --root ' + ROOT + ' --write (статусы и журнал). $SKILL — каталог скилла research-engine.'
 const tail = CFG.next.replace(/ROOT/g, ROOT).replace(/^Дальше: /, '')
 
 return {
   stage: STAGE,
   root: ROOT,
+  model: MODEL || 'модель сессии',
   built,
   failed,
   next: failed.length
-    ? 'Сначала перезапусти упавшие задачи: synthesis.mjs со stage ' + STAGE + ' и args.labels из failed. Потом — ' + tail
-    : 'Дальше: ' + tail,
+    ? 'Сначала перезапусти упавшие задачи: synthesis.mjs со stage ' + STAGE + ' и args.labels ' + JSON.stringify(failed.map(l => l.replace(/^[a-z]+__/, ''))) + '. Потом — ' + status + ' Дальше: ' + tail
+    : 'Сначала ' + status + ' Дальше: ' + tail,
 }

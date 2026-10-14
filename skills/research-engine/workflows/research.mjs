@@ -1,7 +1,7 @@
 export const meta = {
   name: 'research-engine-research',
   description: 'Стадия ресерча движка: агент на тему пишет полный отчёт по файлу задачи, верификатор проверяет числа и достраивает тот же отчёт',
-  whenToUse: 'После того как render-tasks.mjs отрендерил state/tasks/. args: { root: "/abs/path/<slug>-engine", labels: ["01-slug", "02-slug"], verify?: true, effort?: "high", schemas?: {} }. Партия — 3-4 темы за вызов: девять тяжёлых агентов разом выжигают лимит сессии.',
+  whenToUse: 'После того как render-tasks.mjs отрендерил state/tasks/. args: { root: "/abs/path/<slug>-engine", labels: ["01-slug", "02-slug"], stage?: "research" | "verify", verify?: true, effort?: "high", model?: "<id>", schemas?: {} }. stage "verify" — только верификатор поверх готового отчёта: так добиваются verifyFailed и notGrown, не переписывая отчёт заново. Партия — 3-4 темы за вызов: девять тяжёлых агентов разом выжигают лимит сессии.',
   phases: [
     { title: 'Research', detail: 'агент на тему читает state/tasks/research__<slug>.md и пишет полный отчёт в reports/' },
     { title: 'Verify', detail: 'верификатор читает state/tasks/verify__<slug>.md, перепроверяет числа и достраивает тот же отчёт' },
@@ -18,14 +18,27 @@ if (RAW_ROOT.charAt(0) !== '/') throw new Error('args.root обязан быть
 const ROOT = RAW_ROOT.replace(/\/+$/, '')
 if (!ROOT) throw new Error('args.root = / — это не корень движка. Передай каталог движка, например /Users/me/Desktop/Projects/skills/foo-engine')
 
-const labels = [...new Set((Array.isArray(A.labels) ? A.labels : []).map(x => String(x).trim().replace(/^(research|verify)__/, '')).filter(Boolean))]
-if (!labels.length) {
-  throw new Error('Пустой args.labels. Передай слаги тем из engine.json, например { root: "' + ROOT + '", labels: ["01-first-topic", "02-second-topic"] }. Файлы задач должны быть уже отрендерены: node scripts/render-tasks.mjs --root ' + ROOT + ' --stage research')
+// research — ресерчер, следом верификатор (по умолчанию); verify — только верификатор поверх
+// готового отчёта. Повтор верификации через research заново пишет отчёт с нуля: это час
+// работы и полмиллиона токенов на тему ради того, что стоило одного верификатора.
+const STAGE = String(A.stage || 'research')
+if (STAGE !== 'research' && STAGE !== 'verify') {
+  throw new Error('args.stage принимает "research" (ресерч, следом верификация) или "verify" (только верификатор поверх готового отчёта), пришло: ' + STAGE)
 }
 
-const WITH_VERIFY = A.verify !== false && A.verify !== 'false' && A.verify !== 0
+const labels = [...new Set((Array.isArray(A.labels) ? A.labels : []).map(x => String(x).trim().replace(/^(research|verify)__/, '')).filter(Boolean))]
+if (!labels.length) {
+  throw new Error('Пустой args.labels. Передай слаги тем из engine.json, например { root: "' + ROOT + '", labels: ["01-first-topic", "02-second-topic"] }. Файлы задач должны быть уже отрендерены: node $SKILL/scripts/render-tasks.mjs --root ' + ROOT + ' --stage ' + STAGE + ' ($SKILL — каталог скилла research-engine)')
+}
+
+const ONLY_VERIFY = STAGE === 'verify'
+const WITH_VERIFY = ONLY_VERIFY || (A.verify !== false && A.verify !== 'false' && A.verify !== 0)
 const EFFORT = A.effort || 'high'
+// Модель не задана — агент наследует модель сессии; это почти всегда правильно.
+const MODEL = A.model ? String(A.model) : ''
 const OVERRIDE = A.schemas || {}
+
+const agentOpts = (label, phase, schema) => Object.assign({ label, phase, schema, effort: EFFORT }, MODEL ? { model: MODEL } : {})
 
 const RESEARCH_SCHEMA = OVERRIDE.research || {
   type: 'object',
@@ -76,53 +89,71 @@ const researchPrompt = (slug) => wrap('research__' + slug, 'Ты ресерче�
 
 const verifyPrompt = (slug) => wrap('verify__' + slug, 'Ты верификатор и достройщик отчёта по теме ' + slug + '. Твоя работа делает отчёт полнее и надёжнее, а не короче: объём после тебя обязан вырасти. Ничего не удаляй; опровергнутое утверждение переписывается с пометкой «опровергнуто» и источником опровержения, но остаётся в тексте.')
 
-phase('Research')
-log('Тем в партии: ' + labels.length + ' — ' + labels.join(', ') + (WITH_VERIFY ? ' · с верификацией' : ' · без верификации (args.verify = false)'))
+const verifyAgent = (slug) => agent(verifyPrompt(slug), agentOpts('verify__' + slug, 'Verify', VERIFY_SCHEMA))
+
+phase(ONLY_VERIFY ? 'Verify' : 'Research')
+log('Тем в партии: ' + labels.length + ' — ' + labels.join(', ') +
+  (ONLY_VERIFY ? ' · только верификация (args.stage = verify), отчёты не переписываются'
+    : WITH_VERIFY ? ' · с верификацией' : ' · без верификации (args.verify = false)') +
+  (MODEL ? ' · модель ' + MODEL : ''))
 if (labels.length > 4) log('Внимание: партия больше четырёх тем. Прошлый прогон девяти тяжёлых агентов разом сжёг лимит сессии за пять минут; безопасная партия — 3-4 темы.')
 
-const results = await pipeline(
-  labels,
+const results = ONLY_VERIFY
+  ? await parallel(labels.map(slug => () => verifyAgent(slug).then(v => (v ? { slug, research: null, verify: v } : null))))
+  : await pipeline(
+      labels,
 
-  (slug) => agent(researchPrompt(slug), { label: 'research__' + slug, phase: 'Research', schema: RESEARCH_SCHEMA, effort: EFFORT }),
+      (slug) => agent(researchPrompt(slug), agentOpts('research__' + slug, 'Research', RESEARCH_SCHEMA)),
 
-  (res, slug) => {
-    if (!res) return null
-    if (!WITH_VERIFY) return { slug, research: res, verify: null }
-    return agent(verifyPrompt(slug), { label: 'verify__' + slug, phase: 'Verify', schema: VERIFY_SCHEMA, effort: EFFORT })
-      .then(v => ({ slug, research: res, verify: v || null }))
-  }
-)
+      (res, slug) => {
+        if (!res) return null
+        if (!WITH_VERIFY) return { slug, research: res, verify: null }
+        return verifyAgent(slug).then(v => ({ slug, research: res, verify: v || null }))
+      }
+    )
 
 const done = (results || []).filter(Boolean)
-const failed = labels.filter(s => !done.some(d => d.slug === s))
-const verifyFailed = WITH_VERIFY ? done.filter(d => !d.verify).map(d => d.slug) : []
+// В режиме verify «не собрался» значит «верификатор упал»: отчёт на месте, переписывать его не надо.
+const failed = ONLY_VERIFY ? [] : labels.filter(s => !done.some(d => d.slug === s))
+const verifyFailed = ONLY_VERIFY
+  ? labels.filter(s => !done.some(d => d.slug === s))
+  : WITH_VERIFY ? done.filter(d => !d.verify).map(d => d.slug) : []
 const notGrown = done.filter(d => d.verify && d.verify.wordsAfter && d.verify.wordsBefore && d.verify.wordsAfter <= d.verify.wordsBefore).map(d => d.slug)
 
-log('Отчётов собрано: ' + done.length + ' из ' + labels.length + (failed.length ? ' · не собрались: ' + failed.join(', ') : '') + (verifyFailed.length ? ' · без верификации: ' + verifyFailed.join(', ') : ''))
-if (notGrown.length) log('Отчёт после верификации не вырос: ' + notGrown.join(', ') + '. Это брак по закону конвейера — перезапусти verify по этим темам.')
+log((ONLY_VERIFY ? 'Верифицировано: ' + done.length : 'Отчётов собрано: ' + done.length) + ' из ' + labels.length +
+  (failed.length ? ' · не собрались: ' + failed.join(', ') : '') + (verifyFailed.length ? ' · без верификации: ' + verifyFailed.join(', ') : ''))
+if (notGrown.length) log('Отчёт после верификации не вырос: ' + notGrown.join(', ') + '. Это брак по закону конвейера — перезапусти верификацию по этим темам (args.stage = verify).')
+
+// Workflow не видит файловой системы: статусы в engine.json и строку журнала ставит status.mjs.
+const after = 'node $SKILL/scripts/status.mjs --root ' + ROOT + ' --write (статусы и журнал), затем node $SKILL/scripts/audit.mjs --root ' + ROOT + ' --stage research. $SKILL — каталог скилла research-engine.'
+const retry = []
+if (failed.length) retry.push('ресерч заново: research.mjs с args.labels ' + JSON.stringify(failed))
+const reverify = [...new Set([...verifyFailed, ...notGrown])]
+if (reverify.length) retry.push('только верификация, без повторного ресерча: research.mjs с args.stage "verify" и args.labels ' + JSON.stringify(reverify))
 
 return {
-  stage: 'research',
+  stage: STAGE,
   root: ROOT,
   verify: WITH_VERIFY,
+  model: MODEL || 'модель сессии',
   reports: done.map(d => ({
     topic: d.slug,
-    path: d.research.reportPath,
-    result: resultFile('research__' + d.slug),
-    headline: d.research.headline,
-    sources: d.research.sourceCount,
-    words: (d.verify && d.verify.wordsAfter) || d.research.approxWords,
+    path: d.research ? d.research.reportPath : ROOT + '/reports/' + d.slug + '.md',
+    result: resultFile((d.research ? 'research__' : 'verify__') + d.slug),
+    headline: d.research ? d.research.headline : '',
+    sources: d.research ? d.research.sourceCount : null,
+    words: (d.verify && d.verify.wordsAfter) || (d.research && d.research.approxWords) || null,
     coverage: (d.verify && d.verify.coverageVerdict) || 'unverified',
-    keyFindings: d.research.keyFindings || [],
-    disputes: d.research.disputes || [],
-    unverified: d.research.unverified || [],
-    stillMissing: (d.verify && d.verify.stillMissing) || d.research.notCovered || [],
+    keyFindings: (d.research && d.research.keyFindings) || [],
+    disputes: (d.research && d.research.disputes) || [],
+    unverified: (d.research && d.research.unverified) || [],
+    stillMissing: (d.verify && d.verify.stillMissing) || (d.research && d.research.notCovered) || [],
     corrections: (d.verify && d.verify.corrections) || [],
   })),
   failed,
   verifyFailed,
   notGrown,
-  next: (failed.length || verifyFailed.length || notGrown.length)
-    ? 'Сначала добей провалы: перезапусти research.mjs с args.labels из failed, verifyFailed и notGrown. Потом — проверка: node scripts/audit.mjs --root ' + ROOT + ' --stage research'
-    : 'Дальше: node scripts/audit.mjs --root ' + ROOT + ' --stage research, затем следующая партия тем, а когда темы закончатся — node scripts/render-tasks.mjs --root ' + ROOT + ' --stage synth и synthesis.mjs со stage synth',
+  next: retry.length
+    ? 'Сначала добей провалы — ' + retry.join('; ') + '. Потом: ' + after
+    : 'Дальше: ' + after + ' Затем следующая партия тем; когда темы кончатся — render-tasks.mjs --stage synth и synthesis.mjs со stage synth.',
 }

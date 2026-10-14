@@ -5,6 +5,12 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import {
+  die, isDir, isFile, readText, readJson, countWords, fmt, plural, wordsRu,
+  codeFenceMask, maskInlineCode, headings, findVerificationHeading,
+  normalizeEngine, synthFileName, isGaps, isBankNav, bankLayout, DEFAULT_FINISH,
+  normalizeBrief, acceptanceCoverage,
+} from './lib/engine.mjs'
 
 const USAGE = `audit.mjs — проверка закона конвейера: ни один шаг не сжимает содержание.
 
@@ -48,11 +54,6 @@ const MONTHS = /(январ|феврал|март|апрел|ма[йя]|июн|�
 
 // ---------------------------------------------------------------- аргументы
 
-function die(msg, code = 2) {
-  console.error('Ошибка: ' + msg)
-  process.exit(code)
-}
-
 function parseArgs(argv) {
   const out = { root: '', stage: 'all', json: false }
   for (let i = 0; i < argv.length; i++) {
@@ -76,26 +77,9 @@ function parseArgs(argv) {
 
 // ---------------------------------------------------------------- файлы
 
-function isDir(p) { try { return fs.statSync(p).isDirectory() } catch { return false } }
-function isFile(p) { try { return fs.statSync(p).isFile() } catch { return false } }
-function readText(p) { try { return fs.readFileSync(p, 'utf8') } catch { return null } }
-function readJson(p) { const t = readText(p); if (t == null) return null; try { return JSON.parse(t) } catch { return null } }
 function listMd(dir) {
   try { return fs.readdirSync(dir).filter(f => f.endsWith('.md')).sort() } catch { return [] }
 }
-
-const countWords = (t) => (t ? (t.match(/[\p{L}\p{N}][\p{L}\p{N}'’\-]*/gu) || []).length : 0)
-const fmt = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ' ')
-
-const plural = (n, one, few, many) => {
-  const a = Math.abs(n) % 100
-  const b = a % 10
-  if (a > 10 && a < 20) return many
-  if (b > 1 && b < 5) return few
-  if (b === 1) return one
-  return many
-}
-const wordsRu = (n) => fmt(n) + ' ' + plural(n, 'слово', 'слова', 'слов')
 
 // ---------------------------------------------------------------- находки
 
@@ -120,28 +104,6 @@ function warn(section, file, line, code, message) { push('warn', section, file, 
 function note(section, message) { notes.push({ section, message }) }
 
 // ---------------------------------------------------------------- разбор md
-
-function codeFenceMask(lines) {
-  const mask = new Array(lines.length).fill(false)
-  let inFence = false
-  for (let i = 0; i < lines.length; i++) {
-    if (/^\s*(```|~~~)/.test(lines[i])) { inFence = !inFence; mask[i] = true; continue }
-    mask[i] = inFence
-  }
-  return mask
-}
-
-function headings(text, maxDepth = 6) {
-  const lines = text.split('\n')
-  const mask = codeFenceMask(lines)
-  const out = []
-  for (let i = 0; i < lines.length; i++) {
-    if (mask[i]) continue
-    const m = /^(#{1,6})\s+(.+?)\s*$/.exec(lines[i])
-    if (m && m[1].length <= maxDepth) out.push({ line: i + 1, level: m[1].length, title: m[2] })
-  }
-  return out
-}
 
 // вопросы ТЗ: нумерованные пункты раздела «Вопросы ресерча»
 function extractQuestions(promptText) {
@@ -276,9 +238,12 @@ function checkLinks(section, file, text) {
   const dir = path.dirname(file)
   for (let i = 0; i < lines.length; i++) {
     if (mask[i]) continue
+    // Inline-код не ссылка: живой прогон дал два ложных блокера на ripgrep-паттерне
+    // вида `[a-z](...)` в обратных кавычках.
+    const line = maskInlineCode(lines[i])
     const re = /\[[^\]]*\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)/g
     let m
-    while ((m = re.exec(lines[i]))) {
+    while ((m = re.exec(line))) {
       let target = m[1]
       if (/^(https?:|mailto:|tel:|data:|#)/i.test(target)) continue
       target = target.split('#')[0]
@@ -343,8 +308,12 @@ if (!engine) {
   output()
 }
 
-const topics = Array.isArray(engine.topics) ? engine.topics.filter(t => t && t.slug) : []
-const syntheses = Array.isArray(engine.syntheses) ? engine.syntheses.filter(s => s && (s.label || s.file)) : []
+const { topics, syntheses } = normalizeEngine(engine)
+const { entry: bankEntry, parts: bankParts } = bankLayout(syntheses)
+// Особые файлы движка: GAPS.md пишет стадия critique, навигатор банка, собранного частями, —
+// стадия merge. У них нет тем в primary и нет ТЗ в synthesis-spec; мерить их порогом
+// «четверть от primary-отчётов» и требовать от них primary — ложные находки.
+const isSpecial = (s) => isGaps(s) || (bankParts.length > 0 && s === bankEntry)
 const runLog = readText(path.join(ROOT, 'state', 'run-log.md')) || ''
 
 note('Каркас', 'движок: ' + (engine.title || engine.slug || '(без названия)') +
@@ -358,6 +327,28 @@ if (!syntheses.length) warn('Каркас', enginePath, 0, 'no-syntheses', 'в e
 if (doPrompts) {
   const readme = path.join(ROOT, 'prompts', 'README.md')
   if (!isFile(readme)) warn('ТЗ и карта тем', readme, 0, 'no-prompts-readme', 'нет файла prompts/README.md — карты «тема → свод» нет')
+
+  // Бриф: работа базы и контрольные вопросы (references/BRIEF.md). Тема без контрольного
+  // вопроса — допустима (фундамент), контрольный вопрос без темы — база его не ответит.
+  if (!engine.brief) {
+    warn('ТЗ и карта тем', enginePath, 0, 'no-brief',
+      'в engine.json нет брифа — работа базы и контрольные вопросы не заданы, готовность базы мерить нечем (references/BRIEF.md, brief.mjs)')
+  } else {
+    const brief = normalizeBrief(engine.brief)
+    const cov = acceptanceCoverage(brief, topics)
+    if (!brief.acceptance.length) {
+      warn('ТЗ и карта тем', enginePath, 0, 'no-acceptance', 'в брифе нет контрольных вопросов — критику и заказчику нечем принять базу')
+    } else if (topics.length) {
+      for (const id of cov.uncovered) {
+        const a = brief.acceptance.find(x => x.id === id)
+        warn('ТЗ и карта тем', enginePath, 0, 'acceptance-uncovered',
+          'контрольный вопрос ' + id + ' не закрыт ни одной темой (topics[].answers) — база на него не ответит: ' + a.question.slice(0, 90))
+      }
+    }
+    for (const u of cov.unknown) {
+      warn('ТЗ и карта тем', enginePath, 0, 'acceptance-unknown', 'тема ' + u.topic + ' ссылается на контрольный вопрос ' + u.id + ', которого нет в брифе')
+    }
+  }
 
   for (const t of topics) {
     const feedsFromTopic = Array.isArray(t.feeds) ? t.feeds : []
@@ -387,12 +378,13 @@ if (doPrompts) {
   }
 
   for (const s of syntheses) {
+    if (isSpecial(s)) continue
     if (!Array.isArray(s.primary) || !s.primary.length) {
       warn('ТЗ и карта тем', enginePath, 0, 'synthesis-without-primary',
-        'свод ' + (s.label || s.file) + ' без primary-темы — он соберётся из воздуха')
+        'свод ' + s.label + ' без primary-темы — он соберётся из воздуха')
     }
-    const spec = path.join(ROOT, 'synthesis-spec', (s.label || '') + '.md')
-    if (s.label && !isFile(spec)) {
+    const spec = path.join(ROOT, 'synthesis-spec', s.label + '.md')
+    if (!isFile(spec)) {
       warn('ТЗ и карта тем', spec, 0, 'no-synthesis-spec', 'нет ТЗ на свод ' + s.label)
     }
   }
@@ -427,7 +419,7 @@ if (doResearch || doSynth) {
     if (!doResearch) continue
 
     // заголовок ищем по смыслу: живой прогон показал, что агент пишет и «## 8. Протокол верификации от <дата>»
-    const verifyHead = headings(text, 3).find(h => h.level <= 3 && /^(\d+[.)]\s*)?(протокол\s+)?верификаци/i.test(h.title))
+    const verifyHead = findVerificationHeading(text)
     const vr = verifyResult(ROOT, slug)
     const loggedVerify = runLog.includes('verify__' + slug)
     const verifyExpected = status === 'verified' || !!vr || loggedVerify
@@ -485,7 +477,9 @@ if (doResearch || doSynth) {
 // ---- Своды
 if (doSynth) {
   for (const s of syntheses) {
-    const file = s.file || String(s.label || 'SYNTHESIS').toUpperCase() + '.md'
+    // GAPS.md проверяется ниже, как файл финиша: он не надмножество отчётов, а их ревизия
+    if (isGaps(s)) continue
+    const file = synthFileName(s)
     const p = path.join(ROOT, 'synthesis', file)
     const text = readText(p)
     const status = String(s.status || 'planned')
@@ -498,10 +492,16 @@ if (doSynth) {
       continue
     }
     const words = countWords(text)
+    if (isSpecial(s)) {
+      // навигатор поверх частей банка: данные живут в частях, сам он — вход в них
+      note('Своды', file + ': ' + wordsRu(words) + ' · навигатор банка фактов поверх ' + bankParts.length + ' ' +
+        plural(bankParts.length, 'части', 'частей', 'частей') + ', порог четверти к нему не применяется')
+      continue
+    }
     const primary = Array.isArray(s.primary) ? s.primary : []
     if (!primary.length) {
       warn('Своды', enginePath, 0, 'synthesis-without-primary',
-        'свод ' + (s.label || file) + ' без primary-темы — он соберётся из воздуха')
+        'свод ' + s.label + ' без primary-темы — он соберётся из воздуха')
     }
     let sum = 0
     const missing = []
@@ -535,7 +535,7 @@ if (doSynth) {
     checkNumbers('Своды', p, text)
   }
 
-  const finish = String(engine.finish || 'base')
+  const finish = String(engine.finish || DEFAULT_FINISH)
   const tail = [['synthesis/GAPS.md', path.join(ROOT, 'synthesis', 'GAPS.md')]]
   if (finish === 'method') {
     tail.push(['METHOD.md', path.join(ROOT, 'METHOD.md')])
