@@ -8,6 +8,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   die, isDir, isFile, readJson, normalizeEngine, briefFindings, acceptanceCoverage, renderBriefMd, workflowArgs,
+  flushAndExit,
 } from './lib/engine.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -110,7 +111,7 @@ if (args.json) {
     acceptance: brief.acceptance.map(a => ({ id: a.id, question: a.question, job: a.job, topics: cov.map[a.id] })),
     recon, written, next,
   }, null, 2))
-  process.exit(blockers.length ? 1 : 0)
+  await flushAndExit(blockers.length ? 1 : 0)
 }
 
 console.log('# Бриф движка «' + (raw.title || raw.slug || path.basename(ROOT)) + '»')
@@ -143,4 +144,4 @@ if (written.length) {
 }
 console.log('')
 console.log('Дальше — ' + next)
-process.exit(blockers.length ? 1 : 0)
+await flushAndExit(blockers.length ? 1 : 0)

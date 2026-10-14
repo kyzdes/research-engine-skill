@@ -24,7 +24,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { STAGES, PREFIX_BY_STAGE, normalizeEngine, stageLabels, appendRunLogRow, todayISO, routeFor, stageOfLabel } from './lib/engine.mjs'
+import { STAGES, PREFIX_BY_STAGE, normalizeEngine, stageLabels, appendRunLogRow, todayISO, routeFor, stageOfLabel, flushAndExit, syncStatuses } from './lib/engine.mjs'
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const SKILL_DIR = path.resolve(SCRIPT_DIR, '..')
@@ -578,7 +578,7 @@ if (opts.skipDone) {
   if (!labels.length) {
     console.log('Все задачи стадии уже сделаны. Дальше: node ' + script('status.mjs') + ' --root ' + opts.root +
       ' --write, затем node ' + script('audit.mjs') + ' --root ' + opts.root)
-    process.exit(0)
+    await flushAndExit(0)
   }
 }
 
@@ -625,7 +625,7 @@ if (opts.dryRun) {
     console.log(renderCommand(j))
     console.log('')
   }
-  process.exit(0)
+  await flushAndExit(0)
 }
 
 let interrupted = false
@@ -647,6 +647,15 @@ const totalSec = Math.round((Date.now() - t0) / 1000)
 table(jobs, results)
 appendRunLog(opts.root, opts, jobs, results, totalSec)
 
+// Статусы тем и сводов — по тому, что агенты записали на диск.
+try {
+  const fresh = JSON.parse(fs.readFileSync(path.join(opts.root, 'engine.json'), 'utf8'))
+  const { changes } = syncStatuses(opts.root, fresh, 'fanout')
+  if (changes.length) console.log('\nСтатусы сверены с диском: ' + changes.join(', '))
+} catch (e) {
+  console.error('Статусы не сверены с диском: ' + e.message + '. Сверь вручную: node ' + script('status.mjs') + ' --root ' + opts.root + ' --write')
+}
+
 const failed = jobs.filter(j => !(results.get(j.label) || {}).ok).map(j => j.label)
 console.log('')
 console.log('Итого: ' + (jobs.length - failed.length) + '/' + jobs.length + ' за ' + Math.round(totalSec / 60) + ' мин.')
@@ -657,7 +666,7 @@ if (failed.length) {
   console.log('Упали: ' + failed.join(', '))
   console.log('Смотри логи в ' + path.join(opts.root, 'state', 'logs') + ', затем перезапусти только упавшие:')
   console.log('  node ' + script('fanout.mjs') + ' --root ' + opts.root + ' --labels ' + failed.join(','))
-  process.exit(1)
+  await flushAndExit(1)
 }
 console.log('Дальше: node ' + script('status.mjs') + ' --root ' + opts.root + ' --write — статусы тем и сводов по диску;')
 console.log('  затем node ' + script('audit.mjs') + ' --root ' + opts.root + ' — проверка закона конвейера по этой стадии.')

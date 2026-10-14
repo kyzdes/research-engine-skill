@@ -16,6 +16,14 @@ export function die(msg, code = 2) {
   process.exit(code)
 }
 
+// Выход после печати. process.exit() сразу после console.log обрезает вывод в пайп: Node
+// дописывает stdout асинхронно, и машинный JSON аудита ломался на ~64 КБ. Пустая запись
+// с колбэком срабатывает, когда ушло всё записанное раньше. Вызывать через await.
+export async function flushAndExit(code = 0) {
+  await new Promise(resolve => process.stdout.write('', resolve))
+  process.exit(code)
+}
+
 export function isDir(p) { try { return fs.statSync(p).isDirectory() } catch { return false } }
 export function isFile(p) { try { return fs.statSync(p).isFile() } catch { return false } }
 export function readText(p) { try { return fs.readFileSync(p, 'utf8') } catch { return null } }
@@ -126,6 +134,168 @@ export function stageLabels(stage, engine) {
   if (stage === 'method') return ['method__method']
   if (stage === 'agent-doc') return ['method__agent']
   return []
+}
+
+// ---------------------------------------------------------------- статусы по диску
+
+// Статус — производная от файлов на диске, а не запись агента: Workflow-исполнители
+// файловой системы не видят и engine.json не трогают. Тема researched — отчёт есть и агент
+// дописал результат (иначе отчёт может быть недописан прямо сейчас), verified — в отчёте
+// раздел «## Верификация». Свод done — файл на диске. Статус только повышается: понижение
+// спрятало бы потерянный файл от audit.mjs, который как раз ловит «статус есть, файла нет».
+export const TOPIC_RANK = { planned: 0, researched: 1, verified: 2 }
+export const SYNTH_RANK = { planned: 0, done: 1 }
+
+export function diskState(raw, root) {
+  const { topics, syntheses } = normalizeEngine(raw)
+  const { entry: bankEntry, parts: bankParts } = bankLayout(syntheses)
+  const result = (label) => isFile(path.join(root, 'state', 'results', label + '.json')) ||
+    isFile(path.join(root, 'state', 'results', label + '.raw.json'))
+  const problems = []
+  const topicRows = topics.map(t => {
+    const slug = String(t.slug)
+    const text = readText(path.join(root, 'reports', slug + '.md'))
+    const words = countWords(text)
+    const verifyHead = words ? findVerificationHeading(text) : null
+    const researchDone = result('research__' + slug)
+    const derived = verifyHead ? 'verified' : (words && researchDone) ? 'researched' : 'planned'
+    const recorded = Object.prototype.hasOwnProperty.call(TOPIC_RANK, t.status) ? t.status : 'planned'
+    if (TOPIC_RANK[recorded] > TOPIC_RANK[derived]) {
+      problems.push(slug + ': в engine.json «' + recorded + '», а на диске ' +
+        (words ? 'нет раздела «## Верификация»' : 'нет отчёта') + ' — файл потерян или записан не туда (audit.mjs покажет блокер)')
+    }
+    if (!words && researchDone) {
+      problems.push(slug + ': результат research__' + slug + '.json есть, а отчёта нет — агент вернул путь, но файл не записан')
+    }
+    if (words && !researchDone && !verifyHead) {
+      problems.push(slug + ': отчёт на диске есть, а результата research__' + slug + '.json нет — агент ещё пишет или оборвался; статус не повышается')
+    }
+    if (words && !verifyHead && result('verify__' + slug)) {
+      problems.push(slug + ': верификатор отчитался, а раздела «## Верификация» в отчёте нет — достройка не доехала до файла')
+    }
+    // отчёт пишется прямо сейчас или агент оборвался: в следующую партию его не ставим
+    const inProgress = Boolean(words && !researchDone && !verifyHead)
+    return { slug, recorded, derived, words, verifyLine: verifyHead ? verifyHead.line : 0, inProgress }
+  })
+  const synthRows = syntheses.map(s => {
+    const file = synthFileName(s)
+    const words = countWords(readText(path.join(root, 'synthesis', file)))
+    const derived = words ? 'done' : 'planned'
+    const recorded = s.status === 'done' ? 'done' : 'planned'
+    if (recorded === 'done' && !words) {
+      problems.push(s.label + ': в engine.json done, а файла synthesis/' + file + ' нет (audit.mjs покажет блокер)')
+    }
+    const role = isGaps(s) ? 'critique' : (bankParts.length && s === bankEntry) ? 'merge' : isBankPart(s) ? 'bank' : 'synth'
+    return { label: String(s.label), file, role, recorded, derived, words }
+  })
+  return { topicRows, synthRows, problems }
+}
+
+// Повышает статусы в raw по выведенным из диска; возвращает список изменений «метка было→стало».
+export function upgradeStatuses(raw, state) {
+  const changes = []
+  const rawTopics = Array.isArray(raw.topics) ? raw.topics : []
+  for (const r of state.topicRows) {
+    const t = rawTopics.find(x => x && String(x.slug) === r.slug)
+    if (t && TOPIC_RANK[r.derived] > TOPIC_RANK[r.recorded]) { changes.push(r.slug + ' ' + r.recorded + '→' + r.derived); t.status = r.derived; r.recorded = r.derived }
+  }
+  const rawSynth = Array.isArray(raw.syntheses) ? raw.syntheses : []
+  for (const r of state.synthRows) {
+    const s = rawSynth.find(x => x && String(x.label || path.basename(String(x.file || ''), '.md').toLowerCase()) === r.label)
+    if (s && SYNTH_RANK[r.derived] > SYNTH_RANK[r.recorded]) { changes.push(r.label + ' ' + r.recorded + '→' + r.derived); s.status = r.derived; r.recorded = r.derived }
+  }
+  return changes
+}
+
+// Запись engine.json через временный файл: оборванная запись не оставит битый файл.
+export function writeEngineJson(root, raw) {
+  const p = path.join(root, 'engine.json')
+  const tmp = p + '.tmp-' + process.pid
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(raw, null, 2) + '\n', 'utf8')
+    fs.renameSync(tmp, p)
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }) } catch { /* нечего убирать */ }
+    throw e
+  }
+}
+
+// Сверка статусов с диском и запись, если что-то повысилось. who — кто сверял (в журнал).
+export function syncStatuses(root, raw, who) {
+  const state = diskState(raw, root)
+  const changes = upgradeStatuses(raw, state)
+  if (changes.length) {
+    writeEngineJson(root, raw)
+    try {
+      appendRunLogRow(root, [todayISO(), 'status', '—', changes.map(c => c.split(' ')[0]).join(', '),
+        'статусов обновлено: ' + changes.length, who + ': ' + changes.join('; ')])
+    } catch { /* журнал не критичен: статусы уже записаны */ }
+  }
+  return { state, changes }
+}
+
+// ---------------------------------------------------------------- цена прогона
+
+// Средний расход токенов на одного агента по ключу маршрута — замеры живых прогонов.
+// Как только в engine.json появляются свои записи runs, оценка берётся из них.
+export const TOKENS_PER_AGENT = {
+  recon: { tokens: 160000, basis: 'замер aso-growth 14.10.2026: 1 агент sonnet, 159 тыс.' },
+  research: { tokens: 460000, basis: 'замер aso-growth 14.10.2026: партия ресерча 8 агентов sonnet+opus, 3,67 млн' },
+  verify: { tokens: 460000, basis: 'тот же замер: ресерчер и верификатор в партии не разделены' },
+  synth: { tokens: 400000, basis: 'без замера' },
+  bank: { tokens: 400000, basis: 'без замера' },
+  merge: { tokens: 300000, basis: 'без замера' },
+  critique: { tokens: 400000, basis: 'без замера' },
+  method: { tokens: 400000, basis: 'без замера' },
+  'agent-doc': { tokens: 150000, basis: 'без замера' },
+}
+// Записи runs по стадии кормят ключи маршрута: партия research — это ресерчер и верификатор.
+const RUN_KEYS = { research: ['research', 'verify'], verify: ['verify'], synth: ['synth', 'bank'] }
+
+// Сколько агентов ещё нужно движку по ключам маршрута.
+// finish — какие файлы финиша уже на диске: { method: bool, agent: bool }.
+export function remainingAgents(raw, state, finish = {}) {
+  const n = {}
+  const add = (k, c = 1) => { n[k] = (n[k] || 0) + c }
+  for (const r of state.topicRows) {
+    if (r.derived === 'planned') { add('research'); add('verify') } else if (r.derived === 'researched') add('verify')
+  }
+  for (const r of state.synthRows) {
+    if (r.derived === 'done') continue
+    if (r.role === 'bank') add('bank')
+    else if (r.role === 'synth') add('synth')
+    else if (r.role === 'merge') add('merge')
+    else if (r.role === 'critique') add('critique')
+  }
+  if (!state.synthRows.some(r => r.role === 'critique')) add('critique')
+  if (String(raw.finish || DEFAULT_FINISH) === 'method') {
+    if (!finish.method) add('method')
+    if (!finish.agent) add('agent-doc')
+  }
+  return n
+}
+
+export function estimateCost(raw, state, root) {
+  const runs = Array.isArray(raw.runs) ? raw.runs : []
+  const own = {}
+  for (const r of runs) {
+    const agents = Number(r && r.agents), tokens = Number(r && r.tokens)
+    if (!(agents > 0 && tokens > 0)) continue
+    for (const k of RUN_KEYS[r.stage] || [r.stage]) {
+      own[k] = own[k] || { agents: 0, tokens: 0 }
+      own[k].agents += agents
+      own[k].tokens += tokens
+    }
+  }
+  const finishDone = (name) => countWords(readText(path.join(root, name))) > 0
+  const need = remainingAgents(raw, state, { method: finishDone('METHOD.md'), agent: finishDone('AGENT.md') })
+  const rows = Object.entries(need).map(([key, agents]) => {
+    const m = own[key]
+    const per = m ? Math.round(m.tokens / m.agents) : (TOKENS_PER_AGENT[key] || { tokens: 400000 }).tokens
+    const basis = m ? 'свои прогоны движка: ' + m.agents + ' агентов' : (TOKENS_PER_AGENT[key] || { basis: 'без замера' }).basis
+    return { key, agents, perAgent: per, tokens: per * agents, basis }
+  })
+  return { rows, agents: rows.reduce((a, r) => a + r.agents, 0), tokens: rows.reduce((a, r) => a + r.tokens, 0) }
 }
 
 // ---------------------------------------------------------------- модели по стадиям

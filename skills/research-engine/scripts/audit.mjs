@@ -9,16 +9,17 @@ import {
   die, isDir, isFile, readText, readJson, countWords, fmt, plural, wordsRu,
   codeFenceMask, maskInlineCode, headings, findVerificationHeading,
   normalizeEngine, synthFileName, isGaps, isBankNav, bankLayout, DEFAULT_FINISH,
-  normalizeBrief, acceptanceCoverage,
+  normalizeBrief, acceptanceCoverage, flushAndExit,
 } from './lib/engine.mjs'
 
 const USAGE = `audit.mjs — проверка закона конвейера: ни один шаг не сжимает содержание.
 
-  node audit.mjs --root <path> [--stage all|prompts|research|synthesis] [--json]
+  node audit.mjs --root <path> [--stage all|prompts|research|synthesis] [--json] [--all]
 
   --root    каталог движка (в нём лежит engine.json). Обязателен.
   --stage   что проверять: all (по умолчанию) | prompts | research | synthesis
   --json    машинный вывод вместо читаемого отчёта
+  --all     все находки по следам сжатия и числам без источника, без лимита 8 на файл
   --help    эта справка
 
 Блокеры (код возврата 1):
@@ -55,7 +56,7 @@ const MONTHS = /(январ|феврал|март|апрел|ма[йя]|июн|�
 // ---------------------------------------------------------------- аргументы
 
 function parseArgs(argv) {
-  const out = { root: '', stage: 'all', json: false }
+  const out = { root: '', stage: 'all', json: false, all: false }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--help' || a === '-h') { console.log(USAGE); process.exit(0) }
@@ -64,6 +65,7 @@ function parseArgs(argv) {
     else if (a === '--stage') out.stage = argv[++i] || ''
     else if (a.startsWith('--stage=')) out.stage = a.slice('--stage='.length)
     else if (a === '--json') out.json = true
+    else if (a === '--all') out.all = true
     else die('неизвестный аргумент ' + a + '\n\n' + USAGE)
   }
   if (!out.root) die('не задан --root <path>\n\n' + USAGE)
@@ -146,11 +148,29 @@ function keywordsOf(text) {
   return out
 }
 
+// Не факты, а реквизиты: даты, идентификаторы препринтов, версии ПО, номера разделов, URL.
+// Живой прогон показал, что именно они давали большую часть находок number-without-source:
+// дата «14.10.2026» читалась как десятичное 14.10, arXiv 2602.23234 — как число.
+const NON_FACTS = [
+  /https?:\/\/\S+/g,
+  /\]\([^)\s]+\)/g,
+  /\b\d{4}-\d{2}-\d{2}(?:[–-]\d{2})?\b/g,
+  /\b\d{1,2}(?:[–-]\d{1,2})?\.\d{1,2}\.\d{2,4}\b/g,
+  /\b(?:arxiv[:\s]*)?\d{4}\.\d{4,5}(?:v\d+)?\b/gi,
+  /\b(?:ios|ipados|macos|watchos|visionos|sdk|xcode|swift|api|v)\s?\d+(?:\.\d+)*\b/gi,
+  /(?:§|раздел\p{L}*\s|разд\.\s?|п\.\s?|пункт\p{L}*\s|guideline\s|guidelines\s)\d+(?:\.\d+)*(?:\.[a-z])?/giu,
+  /`[^`]*`/g,
+  /\b\d+\.\d+\.\d+(?:\.\d+)*(?:\([a-z]\))?/g, // номер пункта правил или версии: 2.3.1(a), 5.6.3
+]
+
+const stripNonFacts = (line) => NON_FACTS.reduce((s, re) => s.replace(re, ' '), line)
+
 function significantNumbers(line) {
   const out = []
   const re = /\d+(?:[.,]\d+)?\s?%|\d+[.,]\d+|\d{3,}/g
+  const clean = stripNonFacts(line)
   let m
-  while ((m = re.exec(line))) {
+  while ((m = re.exec(clean))) {
     const s = m[0]
     if (/^\d{4}$/.test(s) && Number(s) >= 1900 && Number(s) <= 2100) continue
     out.push(s)
@@ -160,7 +180,10 @@ function significantNumbers(line) {
 
 const hasDate = (s) =>
   /\b(19|20)\d{2}\b/.test(s) || /\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/.test(s) || MONTHS.test(s)
-const hasUrl = (s) => /https?:\/\//i.test(s) || /\]\([^)\s]+\)/.test(s)
+// URL — со схемой, markdown-ссылка или голый домен с путём (domain.com/path): так источники
+// часто пишут в списках «· Apple · 14.10.2026 · performance-partners.apple.com/search-api».
+const BARE_URL = /\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|org|net|io|dev|app|ai|ru|co|edu|gov|eu|me|info|tech|uk|de|fr)\b(?:\/[^\s|)]*)?/i
+const hasUrl = (s) => /https?:\/\//i.test(s) || /\]\([^)\s]+\)/.test(s) || BARE_URL.test(s)
 
 // ---------------------------------------------------------------- проверки текста
 
@@ -178,7 +201,7 @@ const stripQuotesAndUrls = (line) => line
   .replace(/“[^“”]*”/g, ' ')
   .replace(/"[^"]*"/g, ' ')
 
-function checkCompression(section, file, text, cap = 8) {
+function checkCompression(section, file, text, cap = args.all ? Infinity : 8) {
   const lines = text.split('\n')
   const mask = codeFenceMask(lines)
   let hits = 0
@@ -202,18 +225,58 @@ function checkCompression(section, file, text, cap = 8) {
   return hits
 }
 
-function checkNumbers(section, file, text, cap = 8) {
+// Ячейки строки markdown-таблицы (без крайних пустых).
+const tableCells = (line) => line.trim().replace(/^\||\|$/g, '').split(/(?<!\\)\|/).map(c => c.trim())
+const SOURCE_COL = /источник|url|ссылк|source|носитель|первоисточник/i
+const DATE_COL = /дата|date|проверен|снят/i
+const EMPTY_CELL = /^(|—|-|–|н\/д|n\/a|нет)$/i
+// Ссылка на список источников отчёта: [12], [S3], [F64], [A-ext].
+const SOURCE_REF = /\[(?:\d{1,3}|[A-ZА-Я][A-Za-zА-Яа-я-]{0,6}\d{0,4})\]/
+
+// Для каждой строки таблицы — ячейки её заголовка: по ним видно, есть ли в таблице
+// колонка источника и колонка даты.
+function tableHeaders(lines, mask) {
+  const out = new Array(lines.length).fill(null)
+  for (let i = 0; i < lines.length; i++) {
+    if (mask[i] || !/^\s*\|/.test(lines[i])) continue
+    const head = tableCells(lines[i])
+    let j = i + 1
+    while (j < lines.length && !mask[j] && /^\s*\|/.test(lines[j])) { out[j] = head; j++ }
+    i = j - 1
+  }
+  return out
+}
+
+// Строка таблицы с заполненной колонкой источника и датой (в строке, в колонке даты
+// или рядом) — с источником: так устроен банк фактов, URL стоит в своей ячейке или
+// источник назван по имени, а полный адрес лежит в списке источников отчёта.
+function tableRowSourced(line, head, win) {
+  if (!head) return false
+  const cells = tableCells(line)
+  const srcIdx = head.findIndex(h => SOURCE_COL.test(h))
+  if (srcIdx < 0 || EMPTY_CELL.test(cells[srcIdx] || '')) return false
+  const dateIdx = head.findIndex(h => DATE_COL.test(h))
+  return hasDate(line) || (dateIdx >= 0 && !EMPTY_CELL.test(cells[dateIdx] || '')) || hasDate(win)
+}
+
+function checkNumbers(section, file, text, cap = args.all ? Infinity : 8) {
   const lines = text.split('\n')
   const mask = codeFenceMask(lines)
+  const heads = tableHeaders(lines, mask)
   let hits = 0
   for (let i = 0; i < lines.length; i++) {
     if (mask[i]) continue
     const line = lines[i]
     if (/^\s*#{1,6}\s/.test(line)) continue
-    if (/^\s*\|?\s*-{3,}/.test(line)) continue
+    if (/^\s*\|?\s*:?-{3,}/.test(line)) continue
     if (!significantNumbers(line).length) continue
+    // Строка расчёта (LTV = $9,99 × 0,85 × 2,22 = $18,87) — вычисление из уже обвязанных
+    // входов, а не новый факт: источник у входов, а не у результата.
+    if (/=/.test(line) && /[×*÷]|\s[-+\/]\s/.test(line)) continue
     const win = lines.slice(Math.max(0, i - 3), Math.min(lines.length, i + 4)).join('\n')
     if (hasDate(win) && hasUrl(win)) continue
+    if (tableRowSourced(line, heads[i], win)) continue
+    if (SOURCE_REF.test(stripNonFacts(line)) && hasDate(win)) continue
     hits++
     if (hits <= cap) {
       const miss = [!hasDate(win) ? 'даты' : null, !hasUrl(win) ? 'URL' : null].filter(Boolean).join(' и ')
@@ -321,7 +384,7 @@ if (!engine) {
     isFile(enginePath)
       ? 'engine.json не читается как JSON — почини файл, без него аудита нет'
       : 'нет файла engine.json — движок не собран или указан не тот --root')
-  output()
+  await output()
 }
 
 const { topics, syntheses } = normalizeEngine(engine)
@@ -586,11 +649,11 @@ if (doSynth) {
   }
 }
 
-output()
+await output()
 
 // ---------------------------------------------------------------- вывод
 
-function output() {
+async function output() {
   const blockers = findings.filter(f => f.level === 'blocker')
   const warns = findings.filter(f => f.level === 'warn')
 
@@ -603,7 +666,7 @@ function output() {
       findings,
       notes,
     }, null, 2))
-    process.exit(blockers.length ? 1 : 0)
+    await flushAndExit(blockers.length ? 1 : 0)
   }
 
   const title = engine && engine.title ? engine.title : path.basename(ROOT)
@@ -630,7 +693,7 @@ function output() {
   } else {
     console.log('Блокеров и предупреждений нет.')
   }
-  process.exit(blockers.length ? 1 : 0)
+  await flushAndExit(blockers.length ? 1 : 0)
 }
 
 function line(f) {

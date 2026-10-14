@@ -56,6 +56,12 @@ function makeEngine(opts = {}) {
 
 const readEngine = (root) => JSON.parse(fs.readFileSync(path.join(root, 'engine.json'), 'utf8'))
 const tasks = (root) => fs.readdirSync(path.join(root, 'state', 'tasks')).sort()
+// Отчёт агента-ресерчера: файл отчёта и результат research__<slug>.json, как пишет агент.
+function writeReport(root, slug, body) {
+  fs.writeFileSync(path.join(root, 'reports', slug + '.md'), body)
+  fs.mkdirSync(path.join(root, 'state', 'results'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'state', 'results', 'research__' + slug + '.json'), JSON.stringify({ topic: slug }))
+}
 
 test('synth: render-tasks и fanout видят один набор задач, GAPS и навигатор банка — не задачи synth', () => {
   const root = makeEngine()
@@ -90,8 +96,8 @@ test('render-tasks возвращает устаревшую копию испо
 
 test('status: статусы по диску, только повышение, строка журнала внутри таблицы', () => {
   const root = makeEngine()
-  fs.writeFileSync(path.join(root, 'reports', '01-alpha.md'), '# 01\n\nтекст отчёта\n\n## Верификация (2026-01-02)\n\nпроверено\n')
-  fs.writeFileSync(path.join(root, 'reports', '02-beta.md'), '# 02\n\nтекст отчёта без верификации\n')
+  writeReport(root, '01-alpha', '# 01\n\nтекст отчёта\n\n## Верификация (2026-01-02)\n\nпроверено\n')
+  writeReport(root, '02-beta', '# 02\n\nтекст отчёта без верификации\n')
   const e = readEngine(root)
   e.topics.find(t => t.slug === '05-epsilon').status = 'verified' // статус опережает диск: отчёта нет
   fs.writeFileSync(path.join(root, 'engine.json'), JSON.stringify(e, null, 2))
@@ -122,7 +128,7 @@ test('status: статусы по диску, только повышение, �
 
 test('status ведёт верификацию отдельным шагом, без повторного ресерча', () => {
   const root = makeEngine()
-  for (const t of TOPICS) fs.writeFileSync(path.join(root, 'reports', t + '.md'), '# ' + t + '\n\nотчёт\n')
+  for (const t of TOPICS) writeReport(root, t, '# ' + t + '\n\nотчёт\n')
   const s = JSON.parse(run('status.mjs', ['--root', root, '--json']).out)
   assert.equal(s.next.stage, 'verify')
   assert.match(s.next.text, /"stage":"verify"/)
@@ -378,4 +384,74 @@ test('audit: маркер сжатия ищется целым словом, ч�
   const audit = JSON.parse(run('audit.mjs', ['--root', root, '--stage', 'research', '--json']).out)
   const comp = audit.findings.filter(f => f.code === 'compression' && f.file.endsWith('01-alpha.md'))
   assert.deepEqual(comp.map(f => f.line), [5])
+})
+
+test('audit: даты, идентификаторы, источник в колонке таблицы, голый домен и расчёт — не «число без источника»; настоящее число — да', () => {
+  const root = makeEngine()
+  fs.writeFileSync(path.join(root, 'reports', '01-alpha.md'), [
+    '# 01', '',
+    '**Дата сборки:** 14.10.2026, данные на 11–13.08.2026.',
+    'Препринт arXiv 2602.23234 и iOS 27.1, пункт 2.3.1(a), раздел 12.1.',
+    '',
+    '| показатель | значение | источник | дата |',
+    '|---|---|---|---|',
+    '| Trial→paid | 43,5 % | RevenueCat | то же |',
+    '',
+    '12. iTunes Search API: лимит 200 · Apple · 14.10.2026 · performance-partners.apple.com/search-api.',
+    'LTV = $9,99 × 0,85 × 2,22 = $18,87.',
+    '', '', '', '', // окно поиска источника — ±3 строки; настоящее число стоит за его пределами
+    'Конверсия страницы выросла на 37,5 % после смены иконки.',
+    '',
+  ].join('\n'))
+  const audit = JSON.parse(run('audit.mjs', ['--root', root, '--stage', 'research', '--json', '--all']).out)
+  const nums = audit.findings.filter(f => f.code === 'number-without-source' && f.file.endsWith('01-alpha.md'))
+  assert.deepEqual(nums.map(f => f.line), [16], JSON.stringify(nums.map(f => f.message)))
+})
+
+test('машинный вывод не обрезается в пайпе: --json на тысячах находок — целый JSON', () => {
+  const root = makeEngine()
+  const body = ['# 01', ''].concat(Array.from({ length: 3000 }, (_, i) => 'Строка ' + i + ': рост на 12,' + (i % 10) + ' % без источника.'))
+  fs.writeFileSync(path.join(root, 'reports', '01-alpha.md'), body.join('\n'))
+  const r = run('audit.mjs', ['--root', root, '--stage', 'research', '--json', '--all'])
+  assert.ok(r.out.length > 200000, 'вывод подозрительно короткий: ' + r.out.length)
+  const audit = JSON.parse(r.out)
+  assert.ok(audit.findings.filter(f => f.code === 'number-without-source').length >= 3000)
+})
+
+test('status: отчёт без результата агента — «в работе», статус не повышается и в партию не ставится', () => {
+  const root = makeEngine()
+  fs.writeFileSync(path.join(root, 'reports', '01-alpha.md'), '# 01\n\nнедописанный отчёт\n')
+  const s = JSON.parse(run('status.mjs', ['--root', root, '--json', '--write']).out)
+  const t = s.topics.find(x => x.slug === '01-alpha')
+  assert.equal(t.inProgress, true)
+  assert.equal(t.derived, 'planned')
+  assert.ok(!s.next.labels.includes('01-alpha'), 'тема в работе попала в следующую партию')
+  assert.match(s.next.text, /в работе/)
+  assert.equal(readEngine(root).topics[0].status, 'planned')
+})
+
+test('render-tasks сам сверяет статусы с диском перед стадией', () => {
+  const root = makeEngine()
+  writeReport(root, '01-alpha', '# 01\n\nтекст\n\n## Верификация (2026-01-02)\n\nок\n')
+  const r = run('render-tasks.mjs', ['--root', root, '--stage', 'research'])
+  assert.equal(r.code, 0, r.err)
+  assert.match(r.out, /Статусы сверены с диском[^\n]*01-alpha planned→verified/)
+  assert.equal(readEngine(root).topics.find(t => t.slug === '01-alpha').status, 'verified')
+})
+
+test('status --record пишет партию в runs и уточняет оценку цены по своим прогонам', () => {
+  const root = makeEngine()
+  const before = JSON.parse(run('status.mjs', ['--root', root, '--json']).out).cost
+  assert.ok(before.agents > 0 && before.tokens > 0)
+  const research = before.rows.find(r => r.key === 'research')
+  assert.match(research.basis, /замер/)
+  const w = run('status.mjs', ['--root', root, '--record', 'research', '--agents', '8', '--tokens', '8000000', '--minutes', '70', '--labels', '01-alpha,02-beta'])
+  assert.equal(w.code, 0, w.err)
+  const e = readEngine(root)
+  assert.equal(e.runs.at(-1).tokens, 8000000)
+  const after = JSON.parse(run('status.mjs', ['--root', root, '--json']).out).cost
+  const r2 = after.rows.find(r => r.key === 'research')
+  assert.equal(r2.perAgent, 1000000)
+  assert.match(r2.basis, /свои прогоны/)
+  assert.match(fs.readFileSync(path.join(root, 'state', 'run-log.md'), 'utf8'), /\| research \| claude \| 01-alpha, 02-beta \| 8 агентов, 8 000 000 токенов, 70 мин \|/)
 })

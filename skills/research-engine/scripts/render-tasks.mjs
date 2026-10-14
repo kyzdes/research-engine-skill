@@ -12,7 +12,7 @@ import {
   STAGES, DEFAULT_FINISH, DEFAULT_WORDS, normalizeEngine, synthFileName, isGaps,
   bankLayout, synthStageEntries, syncToolchain, toolchainDrift,
   normalizeBrief, jobsText, acceptanceText, inputsText, sourcesText, strList, MISSION_STUB_RE,
-  workflowArgs,
+  workflowArgs, syncStatuses,
 } from './lib/engine.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -387,7 +387,12 @@ if (emptyPerim.length) warnings.push('в engine.json пусто поле ' + emp
 const FS_HINT = '\nПроверь права на каталог state/tasks и что --root ведёт в каталог движка.'
 
 let toolchain = []
+let statusChanges = []
 if (!argv.dryRun) {
+  // Статусы сверяются с диском перед каждой стадией: Workflow-исполнители engine.json не
+  // трогают, и без этого шага аудит молчит там, где должен ставить блокер.
+  try { statusChanges = syncStatuses(ROOT, engine, 'render-tasks').changes }
+  catch (e) { console.error('Предупреждение: статусы не сверены с диском — ' + e.message) }
   // state/results заводим здесь же: путь результата уходит в промпт, а записывает его агент —
   // если каталога нет, агент упирается в ENOENT последним действием, когда работа уже сделана.
   for (const d of [path.join(ROOT, 'state', 'tasks'), path.join(ROOT, 'state', 'results')]) {
@@ -445,6 +450,11 @@ if (argv.dryRun && tasks.length === 1) {
 if (skipped.length && !argv.force) {
   console.log('')
   console.log('Не тронуто файлов: ' + skipped.length + '. Перерендерить поверх — повтори с --force (это нужно всегда, когда правил mission, периметр или состав тем).')
+}
+
+if (statusChanges.length) {
+  console.log('')
+  console.log('Статусы сверены с диском и записаны в engine.json: ' + statusChanges.join(', '))
 }
 
 if (toolchain.length) {
