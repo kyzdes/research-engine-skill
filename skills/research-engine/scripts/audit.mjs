@@ -5,12 +5,16 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   die, isDir, isFile, readText, readJson, countWords, fmt, plural, wordsRu,
-  codeFenceMask, maskInlineCode, headings, findVerificationHeading,
+  codeFenceMask, maskInlineCode, headings, verificationOf,
   normalizeEngine, synthFileName, isGaps, isBankNav, bankLayout, DEFAULT_FINISH,
-  normalizeBrief, acceptanceCoverage, flushAndExit,
+  normalizeBrief, acceptanceCoverage, flushAndExit, resolveRoot, takeValue, matrixFindings,
+  gapsRelPath, schemaProblems, agentResult,
 } from './lib/engine.mjs'
+
+const SKILL = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
 const USAGE = `audit.mjs — проверка закона конвейера: ни один шаг не сжимает содержание.
 
@@ -23,14 +27,29 @@ const USAGE = `audit.mjs — проверка закона конвейера: �
   --help    эта справка
 
 Блокеры (код возврата 1):
-  нет отчёта на прогнанную тему · в отчёте нет раздела «## Верификация» ·
-  отчёт после верификации не вырос · свод короче четверти суммарного объёма своих
-  primary-отчётов · нет файла свода, помеченного done · битая внутренняя ссылка.
+  no-engine-json       нет engine.json или он не читается
+  no-report            тема прогонялась (статус, результат агента), а отчёта нет или он пуст
+  no-verification      верификация числится (статус verified, результат verify__), а раздела
+                       «## Верификация», подписанного верификатором, в отчёте нет
+  no-growth            отчёт после верификации не вырос (wordsAfter ≤ wordsBefore)
+  synthesis-too-short  свод короче четверти суммарного объёма своих primary-отчётов
+  no-synthesis-file    свод (или GAPS.md) помечен done, а файла нет или он пуст
+  broken-link          битая внутренняя ссылка в markdown
 
 Предупреждения (код возврата 0):
-  следы сжатия («и т.д.», «см. выше», «аналогично», «и другие», «…») · вопрос ТЗ без
-  ответа в отчёте · число без даты и URL рядом · тема, не питающая ни один свод ·
-  свод без primary-темы · недостающие файлы финиша.`
+  бриф и карта тем     no-brief, no-acceptance, acceptance-uncovered, acceptance-unknown,
+                       matrix (расхождения feeds/primary, метки, дубли файлов),
+                       topic-feeds-nothing, synthesis-without-primary, no-synthesis-spec,
+                       no-prompts-readme, no-prompt, thin-prompt, no-questions-section,
+                       no-topics, no-syntheses
+  отчёты               report-planned, verification-pending, no-words-numbers, words-drift,
+                       question-uncovered (эвристика по опорным словам)
+  текст                compression[-more] («и т.д.», «см. выше», «аналогично», «…» вне цитат,
+                       URL и кода), number-without-source[-more] (число без даты или URL
+                       в окне ±3 строки; реквизиты, расчёты и строки банка с источником
+                       не в счёт)
+  своды и финиш        synthesis-planned, primary-report-missing, finish-file-missing
+  результаты агентов   result-schema (state/results/<label>.json не по схеме стадии)`
 
 const SECTIONS = ['Каркас', 'ТЗ и карта тем', 'Отчёты', 'Своды', 'Ссылки']
 
@@ -60,9 +79,9 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--help' || a === '-h') { console.log(USAGE); process.exit(0) }
-    else if (a === '--root') out.root = argv[++i] || ''
+    else if (a === '--root') out.root = takeValue(argv, i++, a)
     else if (a.startsWith('--root=')) out.root = a.slice('--root='.length)
-    else if (a === '--stage') out.stage = argv[++i] || ''
+    else if (a === '--stage') out.stage = takeValue(argv, i++, a)
     else if (a.startsWith('--stage=')) out.stage = a.slice('--stage='.length)
     else if (a === '--json') out.json = true
     else if (a === '--all') out.all = true
@@ -72,7 +91,7 @@ function parseArgs(argv) {
   if (!['all', 'prompts', 'research', 'synthesis'].includes(out.stage)) {
     die('--stage принимает all | prompts | research | synthesis, получено: ' + out.stage)
   }
-  out.root = path.resolve(out.root)
+  out.root = resolveRoot(out.root)
   if (!isDir(out.root)) die('каталог движка не найден: ' + out.root)
   return out
 }
@@ -324,7 +343,9 @@ function checkLinks(section, file, text) {
     let m
     while ((m = re.exec(line))) {
       let target = m[1]
-      if (/^(https?:|mailto:|tel:|data:|#)/i.test(target)) continue
+      // внешняя ссылка с любой схемой (http, ftp, doi:, file:) или протокол-относительная — не наша забота
+      // точки в схеме нет: «SPEC.md:120» — ссылка на файл с номером строки, а не URL
+      if (/^([a-z][a-z0-9+-]*:|\/\/|#)/i.test(target)) continue
       target = target.split('#')[0]
       if (!target) continue
       try { target = decodeURIComponent(target) } catch { /* оставляем как есть */ }
@@ -357,14 +378,11 @@ function deepNumber(obj, key, depth = 0) {
   return null
 }
 
+// Результат верификатора — тот же, что засчитывает status (lib/engine.mjs → agentResult):
+// сырой возврат упавшего прогона результатом не считается.
 function verifyResult(root, slug) {
-  const dir = path.join(root, 'state', 'results')
-  for (const name of ['verify__' + slug + '.json', 'verify__' + slug + '.raw.json']) {
-    const p = path.join(dir, name)
-    const data = readJson(p)
-    if (data) return { path: p, data }
-  }
-  return null
+  const r = agentResult(root, 'verify__' + slug)
+  return r && r.data ? r : null
 }
 
 // ---------------------------------------------------------------- основной прогон
@@ -393,7 +411,6 @@ const { entry: bankEntry, parts: bankParts } = bankLayout(syntheses)
 // стадия merge. У них нет тем в primary и нет ТЗ в synthesis-spec; мерить их порогом
 // «четверть от primary-отчётов» и требовать от них primary — ложные находки.
 const isSpecial = (s) => isGaps(s) || (bankParts.length > 0 && s === bankEntry)
-const runLog = readText(path.join(ROOT, 'state', 'run-log.md')) || ''
 
 note('Каркас', 'движок: ' + (engine.title || engine.slug || '(без названия)') +
   ' · профиль ' + (engine.profile || '?') + ' · финиш ' + (engine.finish || '?') +
@@ -428,6 +445,8 @@ if (doPrompts) {
       warn('ТЗ и карта тем', enginePath, 0, 'acceptance-unknown', 'тема ' + u.topic + ' ссылается на контрольный вопрос ' + u.id + ', которого нет в брифе')
     }
   }
+
+  for (const m of matrixFindings({ topics, syntheses })) warn('ТЗ и карта тем', enginePath, 0, 'matrix', m)
 
   for (const t of topics) {
     const feedsFromTopic = Array.isArray(t.feeds) ? t.feeds : []
@@ -478,18 +497,18 @@ if (doResearch || doSynth) {
     const p = path.join(ROOT, 'reports', slug + '.md')
     const text = readText(p)
     const status = String(t.status || 'planned')
-    const resDir = path.join(ROOT, 'state', 'results')
+    // Прогон числится по статусу и по результатам агентов на диске, а не по журналу: в журнал
+    // попадают и упавшие задачи, и метка pricing находилась внутри pricing-b2b.
     const ranResearch = status !== 'planned' ||
-      isFile(path.join(resDir, 'research__' + slug + '.json')) ||
-      isFile(path.join(resDir, 'research__' + slug + '.raw.json')) ||
-      !!verifyResult(ROOT, slug) ||
-      runLog.includes('research__' + slug) || runLog.includes('verify__' + slug)
-    if (text == null) {
+      !!agentResult(ROOT, 'research__' + slug) ||
+      !!verifyResult(ROOT, slug)
+    // пустой файл — тот же потерянный отчёт: агент открыл файл и оборвался
+    if (text == null || !countWords(text)) {
       if (!ranResearch) {
         if (doResearch) warn('Отчёты', p, 0, 'report-planned', 'нет файла отчёта, тема в статусе planned — просто ещё не прогнана')
       } else {
         blocker('Отчёты', p, 0, 'no-report',
-          'нет отчёта на тему ' + slug + ', хотя ресерч по ней числится (статус темы «' + status + '») — файл потерян или записан не туда')
+          (text == null ? 'нет отчёта' : 'отчёт пуст') + ' на тему ' + slug + ', хотя ресерч по ней числится (статус темы «' + status + '») — файл потерян, оборван или записан не туда')
       }
       continue
     }
@@ -497,20 +516,20 @@ if (doResearch || doSynth) {
     reportWords.set(slug, words)
     if (!doResearch) continue
 
-    // заголовок ищем по смыслу: живой прогон показал, что агент пишет и «## 8. Протокол верификации от <дата>»
-    const verifyHead = findVerificationHeading(text)
+    // заголовок ищем по смыслу: живой прогон показал, что агент пишет и «## 8. Протокол верификации от <дата>»;
+    // засчитывается только раздел, подписанный верификатором (lib/engine.mjs → verificationOf)
+    const { head: anyHead, signed: verifyHead } = verificationOf(ROOT, slug, text)
     const vr = verifyResult(ROOT, slug)
-    const loggedVerify = runLog.includes('verify__' + slug)
-    const verifyExpected = status === 'verified' || !!vr || loggedVerify
+    const verifyExpected = status === 'verified' || !!vr
 
     if (!verifyHead) {
       if (verifyExpected) {
-        blocker('Отчёты', p, 0, 'no-verification',
-          'в отчёте нет раздела «## Верификация», хотя верификация ' +
-          (status === 'verified' ? 'отмечена статусом темы' : 'числится в state') + ' — отчёт не достроен')
+        blocker('Отчёты', p, anyHead ? anyHead.line : 0, 'no-verification',
+          (anyHead ? 'раздел «' + anyHead.title + '» не подписан верификатором (нет результата verify__' + slug + ' и даты в заголовке)' : 'в отчёте нет раздела «## Верификация»') +
+          ', хотя верификация ' + (status === 'verified' ? 'отмечена статусом темы' : 'числится в state/results') + ' — отчёт не достроен')
       } else {
         warn('Отчёты', p, 0, 'verification-pending',
-          'верификации ещё не было: раздела «## Верификация» нет, статус темы «' + status + '»')
+          'верификации ещё не было: ' + (anyHead ? 'раздел «' + anyHead.title + '» написал не верификатор' : 'раздела «## Верификация» нет') + ', статус темы «' + status + '»')
       }
     }
 
@@ -556,17 +575,21 @@ if (doResearch || doSynth) {
 // ---- Своды
 if (doSynth) {
   for (const s of syntheses) {
-    // GAPS.md проверяется ниже, как файл финиша: он не надмножество отчётов, а их ревизия
-    if (isGaps(s)) continue
     const file = synthFileName(s)
     const p = path.join(ROOT, 'synthesis', file)
     const text = readText(p)
     const status = String(s.status || 'planned')
-    if (text == null) {
+    // GAPS.md — не надмножество отчётов, а их ревизия: порог четверти к нему не применяется,
+    // но done без файла — та же потеря, что у свода
+    if (isGaps(s)) {
+      if (status === 'done' && !countWords(text)) blocker('Своды', p, 0, 'no-synthesis-file', 'нет файла ' + file + ' (или он пуст), а запись gaps помечена done')
+      continue
+    }
+    if (text == null || !countWords(text)) {
       if (status === 'planned') {
         warn('Своды', p, 0, 'synthesis-planned', 'нет файла свода ' + file + ', статус planned — ещё не собран')
       } else {
-        blocker('Своды', p, 0, 'no-synthesis-file', 'нет файла свода ' + file + ', а статус свода «' + status + '»')
+        blocker('Своды', p, 0, 'no-synthesis-file', (text == null ? 'нет файла свода ' : 'пустой файл свода ') + file + ', а статус свода «' + status + '»')
       }
       continue
     }
@@ -615,7 +638,8 @@ if (doSynth) {
   }
 
   const finish = String(engine.finish || DEFAULT_FINISH)
-  const tail = [['synthesis/GAPS.md', path.join(ROOT, 'synthesis', 'GAPS.md')]]
+  const gapsRel = gapsRelPath(syntheses)
+  const tail = [[gapsRel, path.join(ROOT, gapsRel)]]
   if (finish === 'method') {
     tail.push(['METHOD.md', path.join(ROOT, 'METHOD.md')])
     tail.push(['AGENT.md', path.join(ROOT, 'AGENT.md')])
@@ -623,6 +647,31 @@ if (doSynth) {
   }
   for (const [name, p] of tail) {
     if (!isFile(p)) warn('Своды', p, 0, 'finish-file-missing', 'нет файла ' + name + ' — финиш «' + finish + '» не доведён')
+  }
+}
+
+// ---- Результаты агентов: файл state/results/<label>.json читают audit и status, а Workflow
+// проверяет по схеме только возврат в чат. Схема — копия в движке, иначе — в скилле.
+{
+  const SCHEMA_OF = { recon: 'file', research: 'research', verify: 'verify', synth: 'file', merge: 'file', critique: 'gaps', method: 'file' }
+  const resDir = path.join(ROOT, 'state', 'results')
+  let files = []
+  try { files = fs.readdirSync(resDir).filter(f => f.endsWith('.json') && !f.endsWith('.raw.json')).sort() } catch { /* каталога нет */ }
+  const schemaCache = {}
+  const schemaOf = (name) => {
+    if (!(name in schemaCache)) schemaCache[name] = readJson(path.join(ROOT, 'schemas', name + '.json')) || readJson(path.join(SKILL, 'schemas', name + '.json'))
+    return schemaCache[name]
+  }
+  for (const f of files) {
+    const prefix = f.split('__')[0]
+    if (!SCHEMA_OF[prefix]) continue
+    const stageOk = (prefix === 'research' || prefix === 'verify') ? doResearch : (prefix === 'recon' ? doPrompts : doSynth)
+    if (!stageOk) continue
+    const schema = schemaOf(SCHEMA_OF[prefix])
+    if (!schema) continue
+    const data = readJson(path.join(resDir, f))
+    const probs = data ? schemaProblems(data, schema) : ['файл не читается как JSON']
+    if (probs.length) warn('Отчёты', path.join(resDir, f), 0, 'result-schema', 'результат агента не по схеме ' + SCHEMA_OF[prefix] + '.json: ' + probs.slice(0, 5).join('; ') + ' — если файл записан прежней версией скилла, это след старой схемы, а не брак')
   }
 }
 

@@ -24,14 +24,19 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { STAGES, PREFIX_BY_STAGE, normalizeEngine, stageLabels, appendRunLogRow, todayISO, routeFor, stageOfLabel, flushAndExit, syncStatuses } from './lib/engine.mjs'
+import {
+  STAGES, PREFIX_BY_STAGE, normalizeEngine, stageLabels, appendRunLogRow, todayISO, routeFor, stageOfLabel, flushAndExit,
+  syncStatuses, shq, resolveRoot, lawFor, schemaProblems,
+} from './lib/engine.mjs'
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const SKILL_DIR = path.resolve(SCRIPT_DIR, '..')
-const script = (name) => path.join(SCRIPT_DIR, name)
+const script = (name) => shq(path.join(SCRIPT_DIR, name))
 
-// Стадии, где отчёт без интернета — брак.
+// Стадии, где отчёт без интернета — брак. Остальные работают по корпусу на диске: сводчику
+// и критику веб-поиск не нужен, а «бери цифры со страницы» спорит с правилом «числа — из отчётов».
 const WEB_STAGES = ['recon', 'research', 'verify']
+const isWebJob = (label) => WEB_STAGES.includes(label.split('__')[0])
 
 // Стадия → схема возврата (§5 контракта). Ключ — префикс label до двойного подчёркивания.
 const SCHEMA_BY_PREFIX = {
@@ -72,7 +77,8 @@ const HELP = `fanout.mjs — исполнитель стадии движка р
                            -c model_reasoning_effort="<level>"
   --retries <n>            повторов после первого провала (по умолчанию 1)
   --timeout-sec <n>        таймаут на процесс (по умолчанию 5400)
-  --web-search on|off      веб-поиск агенту (по умолчанию on)
+  --web-search on|off      веб-поиск агенту на стадиях recon, research и verify (по умолчанию
+                           on); своды, критик и методика работают по корпусу без интернета
   --sandbox <mode>         песочница codex: read-only | workspace-write |
                            danger-full-access (по умолчанию danger-full-access:
                            агент пишет отчёты и результаты на диск)
@@ -123,9 +129,12 @@ function parseArgs(argv) {
     dryRun: false,
   }
   const need = (i, name) => {
-    if (i + 1 >= argv.length) fail('у флага ' + name + ' нет значения')
-    return argv[i + 1]
+    const v = argv[i + 1]
+    if (v === undefined || (v.startsWith('--') && v.length > 2)) fail('у флага ' + name + ' нет значения')
+    return v
   }
+  // --flag=value раскладывается в два аргумента: так флаги пишут и остальные скрипты движка
+  argv = argv.flatMap(a => (/^--[a-z-]+=/.test(a) ? [a.slice(0, a.indexOf('=')), a.slice(a.indexOf('=') + 1)] : [a]))
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     switch (a) {
@@ -166,7 +175,7 @@ function parseArgs(argv) {
   if (!Number.isFinite(o.concurrency) || o.concurrency < 1 || o.concurrency > 16) fail('--concurrency вне диапазона 1..16')
   if (!Number.isFinite(o.retries) || o.retries < 0 || o.retries > 5) fail('--retries вне диапазона 0..5')
   if (!Number.isFinite(o.timeoutSec) || o.timeoutSec < 30) fail('--timeout-sec меньше 30 секунд — так задача не успеет ничего')
-  o.root = path.resolve(o.root.replace(/^~(?=\/|$)/, process.env.HOME || '~'))
+  o.root = resolveRoot(o.root)
   return o
 }
 
@@ -219,7 +228,9 @@ function normalizeLabels(opts, engine) {
   return unique
 }
 
-function schemaFor(label, root) {
+// required = false: схема нужна только для проверки результата (claude) — без неё проверка
+// пропускается, а не роняет прогон. Codex без схемы не запускается: она уходит в --output-schema.
+function schemaFor(label, root, required = true) {
   const prefix = label.split('__')[0]
   const name = SCHEMA_BY_PREFIX[prefix]
   if (!name) {
@@ -229,6 +240,7 @@ function schemaFor(label, root) {
   if (fs.existsSync(inEngine)) return inEngine
   const inSkill = path.join(SKILL_DIR, 'schemas', name)
   if (fs.existsSync(inSkill)) return inSkill
+  if (!required) return ''
   fail('нет схемы ' + name + ' ни в ' + path.join(root, 'schemas') + ', ни в ' + path.join(SKILL_DIR, 'schemas') +
     '. Схемы копирует в движок engine-init.mjs')
 }
@@ -245,14 +257,20 @@ function taskPrompt(root, label, opts) {
     '',
     'Прочитай этот файл целиком, от первой строки до последней, и выполни его буквально. Файл задачи — контракт, а не вдохновение: пропущенный пункт считается браком. Не пересказывай задачу в ответе и не переспрашивай — выполняй.',
     '',
-    'Закон конвейера: ни один шаг не сжимает содержание. Всё, что ты выбросишь ради краткости, потеряно навсегда — на следующем шаге восстанавливать будет неоткуда. Полнота важнее элегантности: лучше лишняя таблица с цифрами, чем аккуратное саммари.',
+    lawFor(stageOfLabel(label)),
     '',
     'Последним действием запиши результат одним JSON-объектом по схеме из задачи в файл:',
     path.join(root, 'state', 'results', label + '.json'),
     'и верни тот же объект своим финальным ответом. Результат на диске обязателен: без него задача считается проваленной, даже если сам документ написан.',
     '',
     'Рабочий корень движка: ' + root + '. Пути в задаче абсолютные — используй их как есть, ничего не выдумывай.',
+    '',
+    'Если файла задачи нет на диске, ничего не делай и не пиши его сам: ответь одной строкой «нет файла задачи» — исполнитель засчитает это как провал и подскажет, что отрендерить.',
   ]
+  if (!isWebJob(label)) {
+    lines.push('', 'Веб-поиск на этой стадии не нужен: работай по корпусу движка на диске. Факт, которого в корпусе нет, не добирай из памяти — отметь как пробел.')
+    return lines.join('\n')
+  }
   if (opts.webSearch && opts.engine === 'claude') {
     lines.push('', 'Тебе нужен веб-поиск. Если инструменты не загружены, загрузи их одним вызовом ToolSearch с запросом select:WebSearch,WebFetch. Цифры бери со страницы через WebFetch, а не из сниппета выдачи и не по памяти.')
   }
@@ -297,7 +315,7 @@ function buildCommand(label, opts, root, route) {
     // Веб-поиск у codex exec задаётся ключом конфига, флага --search у exec нет.
     // --strict-config превращает опечатку в ключе в громкую ошибку вместо тихого «без интернета».
     if (opts.strictConfig) args.push('--strict-config')
-    args.push('-c', 'tools.web_search=' + (opts.webSearch ? 'true' : 'false'))
+    args.push('-c', 'tools.web_search=' + (opts.webSearch && isWebJob(label) ? 'true' : 'false'))
     if (route.model) args.push('-m', route.model)
     if (route.effort) args.push('-c', 'model_reasoning_effort="' + route.effort + '"')
     args.push(prompt)
@@ -316,10 +334,6 @@ function buildCommand(label, opts, root, route) {
   if (route.effort) args.push('--effort', route.effort)
   args.push(prompt)
   return { cmd: 'claude', args, rawPath, logPath, schema: '', captureStdout: true }
-}
-
-function shq(s) {
-  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(String(s)) ? String(s) : "'" + String(s).replace(/'/g, "'\\''") + "'"
 }
 
 function renderCommand(job) {
@@ -446,6 +460,14 @@ function runAttempt(job, opts, attempt) {
         if (stampAfter <= stampBefore) {
           return finish({ ok: false, code, reason: path.basename(resultPath) + ' не переписан — на диске файл прошлого прогона', sec })
         }
+        // Схема проверяется и на claude: у него нет --output-schema, а audit и status читают
+        // именно этот файл. Лишний или пропущенный ключ — провал, как и обещают шаблоны.
+        if (job.schemaJson) {
+          let data = null
+          try { data = JSON.parse(fs.readFileSync(resultPath, 'utf8')) } catch (e) { data = null }
+          const probs = data ? schemaProblems(data, job.schemaJson) : ['не читается как JSON']
+          if (probs.length) return finish({ ok: false, code, reason: path.basename(resultPath) + ' не по схеме: ' + probs.slice(0, 4).join('; '), sec })
+        }
       }
       finish({ ok: true, code, reason: '', sec })
     })
@@ -546,10 +568,11 @@ function appendRunLog(root, opts, jobs, results, sec) {
   const failed = jobs.map(j => j.label).filter(l => !ok.includes(l))
   const routes = [...new Set(jobs.map(j => (j.route.model || 'хоста') + '/' + (j.route.effort || 'хоста')))].join(', ')
   const note = 'fanout · параллельно ' + opts.concurrency + ' · модель/усилие ' + routes + ' · веб-поиск ' + (opts.webSearch ? 'вкл' : 'выкл') +
-    ' · ' + Math.round(sec / 60) + ' мин' + (failed.length ? ' · упали: ' + failed.join(', ') : '')
+    ' · ' + Math.round(sec / 60) + ' мин' + (failed.length ? ' · упали или не запускались: ' + failed.join(', ') : '')
+  // В колонке «Задачи» — только успешные: журнал читают как «что собрано».
   try {
     appendRunLogRow(root, [
-      todayISO(), opts.stage || 'по списку labels', opts.engine, jobs.map(j => j.label).join(', '),
+      todayISO(), opts.stage || [...new Set(jobs.map(j => stageOfLabel(j.label)))].join('+'), opts.engine, ok.join(', ') || '—',
       ok.length + '/' + jobs.length + ' успешно', note,
     ])
   } catch (e) {
@@ -566,9 +589,11 @@ let labels = normalizeLabels(opts, engine)
 // Файлы задач — единственный источник правды. Нет файла — нечего исполнять.
 const missing = labels.filter(l => !fs.existsSync(path.join(opts.root, 'state', 'tasks', l + '.md')))
 if (missing.length) {
+  const byStage = {}
+  for (const l of missing) { const st = stageOfLabel(l); (byStage[st] = byStage[st] || []).push(l.split('__').slice(1).join('__')) }
   fail('нет файлов задач для: ' + missing.join(', ') +
-    '\n  Сначала отрендерь их: node ' + script('render-tasks.mjs') + ' --root ' + opts.root +
-    (opts.stage ? ' --stage ' + opts.stage : ''))
+    '\n  Сначала отрендерь их: ' + Object.entries(byStage).map(([st, ls]) =>
+      'node ' + script('render-tasks.mjs') + ' --root ' + shq(opts.root) + ' --stage ' + st + ' --labels ' + ls.join(',')).join('; '))
 }
 
 if (opts.skipDone) {
@@ -576,8 +601,8 @@ if (opts.skipDone) {
   labels = labels.filter(l => !fs.existsSync(path.join(opts.root, 'state', 'results', l + '.json')))
   if (before !== labels.length) console.log('Пропущено готовых задач: ' + (before - labels.length) + ' (--skip-done)')
   if (!labels.length) {
-    console.log('Все задачи стадии уже сделаны. Дальше: node ' + script('status.mjs') + ' --root ' + opts.root +
-      ' --write, затем node ' + script('audit.mjs') + ' --root ' + opts.root)
+    console.log('Все задачи стадии уже сделаны. Дальше: node ' + script('status.mjs') + ' --root ' + shq(opts.root) +
+      ' — следующая команда, затем node ' + script('audit.mjs') + ' --root ' + shq(opts.root))
     await flushAndExit(0)
   }
 }
@@ -588,6 +613,10 @@ const jobs = labels.map(l => {
   j.label = l
   j.cwd = opts.root
   j.route = route
+  const schemaPath = j.schema || schemaFor(l, opts.root, false)
+  j.schemaJson = null
+  if (schemaPath) { try { j.schemaJson = JSON.parse(fs.readFileSync(schemaPath, 'utf8')) } catch (e) { j.schemaJson = null } }
+  if (!j.schemaJson) console.error('Предупреждение: нет схемы возврата для ' + l + ' — результат проверяется только на наличие, не по схеме')
   return j
 })
 
@@ -595,17 +624,20 @@ console.log('Движок: ' + (engine.title || engine.slug || opts.root))
 console.log('Стадия: ' + (opts.stage || 'по списку labels') + ' · задач ' + jobs.length + ' · хост ' + opts.engine +
   ' · параллельно ' + opts.concurrency + ' · таймаут ' + opts.timeoutSec + ' с · повторов ' + opts.retries)
 
-// Честный рассказ про веб-поиск: стадии research и verify без него бессмысленны.
+// Честный рассказ про веб-поиск: recon, research и verify без него бессмысленны, остальным он не нужен.
+const webCount = jobs.filter(j => isWebJob(j.label)).length
+const webScope = !webCount ? 'не нужен ни одной задаче партии — стадии работают по корпусу на диске'
+  : webCount === jobs.length ? 'нужен всем задачам партии' : 'нужен ' + webCount + ' из ' + jobs.length + ' задач (recon, research, verify)'
 if (opts.engine === 'codex') {
-  console.log('Веб-поиск: -c tools.web_search=' + (opts.webSearch ? 'true' : 'false') +
+  console.log('Веб-поиск: ' + webScope + '; -c tools.web_search=' + (opts.webSearch && webCount ? 'true' : 'false') + (webCount && webCount < jobs.length ? ' только у них' : '') +
     (opts.strictConfig ? ' (с --strict-config: незнакомый ключ падает громко)' : ' (без --strict-config: незнакомый ключ будет проглочен молча)'))
 } else {
-  console.log('Веб-поиск: у claude флага нет. WebSearch и WebFetch зависят от настроек сессии; ' +
+  console.log('Веб-поиск: ' + webScope + '. У claude флага нет: WebSearch и WebFetch зависят от настроек сессии, ' +
     'требование поднять их вписано в промпт. Если в логе задачи поиска нет — включи их в settings.json хоста.')
 }
 // Считаем по самим задачам, а не по --stage: с --labels research__x стадия пустая,
 // а интернет задаче нужен ровно так же.
-const webJobs = jobs.filter(j => WEB_STAGES.includes(j.label.split('__')[0]))
+const webJobs = jobs.filter(j => isWebJob(j.label))
 if (!opts.webSearch && webJobs.length) {
   console.error('Внимание: --web-search off, а среди задач есть recon/research/verify (' +
     webJobs.map(j => j.label).join(', ') +
@@ -653,7 +685,7 @@ try {
   const { changes } = syncStatuses(opts.root, fresh, 'fanout')
   if (changes.length) console.log('\nСтатусы сверены с диском: ' + changes.join(', '))
 } catch (e) {
-  console.error('Статусы не сверены с диском: ' + e.message + '. Сверь вручную: node ' + script('status.mjs') + ' --root ' + opts.root + ' --write')
+  console.error('Статусы не сверены с диском: ' + e.message + '. Сверь вручную: node ' + script('status.mjs') + ' --root ' + shq(opts.root) + ' --write')
 }
 
 const failed = jobs.filter(j => !(results.get(j.label) || {}).ok).map(j => j.label)
@@ -664,9 +696,24 @@ if (fatal && !interrupted) {
 }
 if (failed.length) {
   console.log('Упали: ' + failed.join(', '))
+  // повтор с теми же флагами: без них --engine claude --model haiku превращался в прогон на codex
+  const keep = []
+  const src = process.argv.slice(2).flatMap(a => (/^--[a-z-]+=/.test(a) ? [a.slice(0, a.indexOf('=')), a.slice(a.indexOf('=') + 1)] : [a]))
+  for (let i = 0; i < src.length; i++) {
+    if (src[i] === '--stage' || src[i] === '--labels') { i++; continue }
+    if (src[i] === '--skip-done' || src[i] === '--dry-run') continue
+    keep.push(src[i])
+  }
   console.log('Смотри логи в ' + path.join(opts.root, 'state', 'logs') + ', затем перезапусти только упавшие:')
-  console.log('  node ' + script('fanout.mjs') + ' --root ' + opts.root + ' --labels ' + failed.join(','))
+  console.log('  node ' + script('fanout.mjs') + ' ' + keep.map(shq).join(' ') + ' --labels ' + failed.join(','))
   await flushAndExit(1)
 }
-console.log('Дальше: node ' + script('status.mjs') + ' --root ' + opts.root + ' --write — статусы тем и сводов по диску;')
-console.log('  затем node ' + script('audit.mjs') + ' --root ' + opts.root + ' — проверка закона конвейера по этой стадии.')
+const R = shq(opts.root)
+const stagesRun = new Set(jobs.map(j => stageOfLabel(j.label)))
+if (stagesRun.has('research')) {
+  const slugs = jobs.filter(j => j.label.startsWith('research__')).map(j => j.label.slice('research__'.length))
+  console.log('Дальше — верификация этих тем отдельным прогоном (fanout пишет только отчёт): node ' + script('fanout.mjs') + ' --root ' + R +
+    ' --stage verify --labels ' + slugs.map(x => 'verify__' + x).join(',') + ' --engine ' + opts.engine + ' (задачи верификатора рендерит render-tasks --stage research).')
+}
+console.log('Дальше: node ' + script('status.mjs') + ' --root ' + R + ' — статусы по диску и следующая команда; расход партии — status.mjs --record <стадия> --agents <N> --tokens <T>;')
+console.log('  затем node ' + script('audit.mjs') + ' --root ' + R + ' — проверка закона конвейера по этой стадии.')

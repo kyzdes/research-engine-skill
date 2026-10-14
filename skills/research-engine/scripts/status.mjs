@@ -11,11 +11,11 @@ import {
   die, isDir, isFile, readText, readJson, countWords, fmt, todayISO,
   normalizeEngine, isGaps, synthStageEntries, appendRunLogRow, toolchainDrift, DEFAULT_FINISH,
   briefFindings, workflowArgs, flushAndExit, diskState, upgradeStatuses, writeEngineJson,
-  estimateCost, TOPIC_RANK, SYNTH_RANK, STAGES,
+  estimateCost, TOPIC_RANK, SYNTH_RANK, STAGES, resolveRoot, shq, takeValue, PREFIX_BY_STAGE,
 } from './lib/engine.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
-const script = (name) => path.join(HERE, name)
+const script = (name) => shq(path.join(HERE, name))
 
 const USAGE = `status.mjs — состояние движка по файлам на диске, оставшаяся цена и следующая команда.
 
@@ -36,7 +36,8 @@ const USAGE = `status.mjs — состояние движка по файлам 
   --help     эта справка
 
 Тема researched — на диске есть reports/<slug>.md и агент записал результат research__<slug>;
-verified — в отчёте есть раздел «## Верификация». Свод done — его файл в synthesis/.`
+verified — в отчёте есть раздел «## Верификация», подписанный верификатором (его результат
+verify__<slug> или дата в заголовке). Свод done — его файл в synthesis/.`
 
 function parseArgs(argv) {
   const out = { root: '', write: false, json: false, batch: 4, record: '', agents: 0, tokens: 0, minutes: 0, labels: '', host: 'claude', note: '' }
@@ -44,7 +45,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     const [key, inline] = a.includes('=') ? [a.slice(0, a.indexOf('=')), a.slice(a.indexOf('=') + 1)] : [a, null]
-    const val = () => (inline != null ? inline : argv[++i])
+    const val = () => (inline != null ? inline : takeValue(argv, i++, key))
     if (a === '--help' || a === '-h') { console.log(USAGE); process.exit(0) }
     else if (a === '--write') out.write = true
     else if (a === '--json') out.json = true
@@ -63,7 +64,7 @@ function parseArgs(argv) {
   if (!Number.isInteger(out.batch) || out.batch < 1 || out.batch > 16) die('--batch принимает целое от 1 до 16')
   if (out.record && !STAGES.includes(out.record)) die('--record принимает стадию: ' + STAGES.join(', '))
   if (out.record && !(out.agents > 0)) die('--record требует --agents N (сколько агентов было в партии)')
-  out.root = path.resolve(out.root)
+  out.root = resolveRoot(out.root)
   if (!isDir(out.root)) die('каталог движка не найден: ' + out.root)
   return out
 }
@@ -116,7 +117,8 @@ if (args.write) {
 // ---------------------------------------------------------------- финиш, дрейф, цена
 
 const finish = String(raw.finish || DEFAULT_FINISH)
-const finishFiles = [['METHOD.md', 'method'], ['AGENT.md', 'agent-doc'], ['INDEX.md', 'index']]
+// Порядок финиша: методика, карта сводов (на неё ссылается AGENT.md), вход для агента.
+const finishFiles = [['METHOD.md', 'method'], ['INDEX.md', 'index'], ['AGENT.md', 'agent-doc']]
   .map(([name, stage]) => ({ name, stage, words: countWords(readText(path.join(ROOT, name))) }))
 const gapsPresent = syntheses.some(isGaps)
   ? synthRows.some(r => r.role === 'critique' && r.words)
@@ -132,8 +134,13 @@ const cost = estimateCost(raw, state, ROOT)
 
 // ---------------------------------------------------------------- следующий шаг
 
+const R = shq(ROOT)
+
 function nextStep() {
-  const render = (stage, labels) => 'node ' + script('render-tasks.mjs') + ' --root ' + ROOT + ' --stage ' + stage +
+  // то же в Codex: fanout по тем же меткам
+  const codex = (stage, labels) => 'Codex: node ' + script('fanout.mjs') + ' --root ' + R + ' --stage ' + stage + ' --labels ' +
+    labels.map(l => PREFIX_BY_STAGE[stage] + '__' + l).join(',') + ' --engine codex'
+  const render = (stage, labels) => 'node ' + script('render-tasks.mjs') + ' --root ' + R + ' --stage ' + stage +
     (labels ? ' --labels ' + labels.join(',') : '')
   // аргументы исполнителя с маршрутом моделей и усилий из engine.json
   const wf = (file, stage, labels) => 'Workflow ' + path.join(ROOT, 'workflows', file) + ' с args ' + JSON.stringify(workflowArgs(raw, ROOT, stage, labels))
@@ -141,7 +148,7 @@ function nextStep() {
   if (!topics.length) {
     const bf = briefFindings(raw, ROOT)
     if (bf.blockers.length) {
-      return { stage: 'brief', text: 'бриф не готов, блокеров ' + bf.blockers.length + ' (первый: ' + bf.blockers[0] + '). Список и следующий шаг: node ' + script('brief.mjs') + ' --root ' + ROOT }
+      return { stage: 'brief', text: 'бриф не готов, блокеров ' + bf.blockers.length + ' (первый: ' + bf.blockers[0] + '). Список и следующий шаг: node ' + script('brief.mjs') + ' --root ' + R }
     }
     return { stage: 'plan', text: 'декомпозиция: бриф готов, тем в engine.json нет — покажи BRIEF.md заказчику и /engine plan; каждой теме — topics[].answers' }
   }
@@ -154,7 +161,8 @@ function nextStep() {
     return {
       stage: 'research', labels: batch,
       text: 'ресерч, партия ' + batch.length + ' из ' + planned.length + ' непрогнанных тем' + busyNote + ':\n    ' +
-        render('research', batch) + '\n    ' + wf('research.mjs', 'research', batch),
+        render('research', batch) + '\n    ' + wf('research.mjs', 'research', batch) +
+        '\n    ' + codex('research', batch) + ', затем ' + codex('verify', batch).replace(/^Codex: /, ''),
     }
   }
   if (busy.length) return { stage: 'wait', labels: busy, text: 'дождись партии: отчёты ещё пишутся — ' + busy.join(', ') }
@@ -164,7 +172,7 @@ function nextStep() {
     return {
       stage: 'verify', labels: batch,
       text: 'верификация без повторного ресерча, ' + batch.length + ' из ' + unverified.length + ':\n    ' +
-        render('verify', batch) + '\n    ' + wf('research.mjs', 'verify', batch),
+        render('verify', batch) + '\n    ' + wf('research.mjs', 'verify', batch) + '\n    ' + codex('verify', batch),
     }
   }
   const synthTodo = synthStageEntries(syntheses).map(s => synthRows.find(r => r.label === String(s.label)))
@@ -174,26 +182,26 @@ function nextStep() {
     return {
       stage: 'synth', labels: batch,
       text: 'своды, партия ' + batch.length + ' из ' + synthTodo.length + ':\n    ' +
-        render('synth', batch) + '\n    ' + wf('synthesis.mjs', 'synth', batch),
+        render('synth', batch) + '\n    ' + wf('synthesis.mjs', 'synth', batch) + '\n    ' + codex('synth', batch),
     }
   }
   const nav = synthRows.find(r => r.role === 'merge')
   if (nav && nav.derived !== 'done') {
-    return { stage: 'merge', labels: ['facts-bank'], text: 'навигатор банка фактов:\n    ' + render('merge') + '\n    ' + wf('synthesis.mjs', 'merge', ['facts-bank']) }
+    return { stage: 'merge', labels: ['facts-bank'], text: 'навигатор банка фактов:\n    ' + render('merge') + '\n    ' + wf('synthesis.mjs', 'merge', ['facts-bank']) + '\n    ' + codex('merge', ['facts-bank']) }
   }
   if (!gapsPresent) {
-    return { stage: 'critique', labels: ['gaps'], text: 'критик полноты:\n    ' + render('critique') + '\n    ' + wf('synthesis.mjs', 'critique', ['gaps']) }
+    return { stage: 'critique', labels: ['gaps'], text: 'критик полноты:\n    ' + render('critique') + '\n    ' + wf('synthesis.mjs', 'critique', ['gaps']) + '\n    ' + codex('critique', ['gaps']) }
   }
   if (finish === 'base') {
-    return { stage: 'done', text: 'финиш base: конвейер доведён до GAPS.md. Прочитай его с пользователем и прогони node ' + script('audit.mjs') + ' --root ' + ROOT }
+    return { stage: 'done', text: 'финиш base: конвейер доведён до GAPS.md. Прочитай его с пользователем и прогони node ' + script('audit.mjs') + ' --root ' + R }
   }
   for (const f of finishFiles) {
     if (f.words) continue
-    if (f.stage === 'index') return { stage: 'index', text: 'карта сводов: node ' + script('build-index.mjs') + ' --root ' + ROOT }
+    if (f.stage === 'index') return { stage: 'index', text: 'карта сводов (на неё ссылается AGENT.md): node ' + script('build-index.mjs') + ' --root ' + R }
     const label = f.stage === 'method' ? 'method' : 'agent'
-    return { stage: f.stage, labels: [label], text: f.name + ':\n    ' + render(f.stage) + '\n    ' + wf('synthesis.mjs', f.stage, [label]) }
+    return { stage: f.stage, labels: [label], text: f.name + ':\n    ' + render(f.stage) + '\n    ' + wf('synthesis.mjs', f.stage, [label]) + '\n    ' + codex(f.stage, [label]) }
   }
-  return { stage: 'done', text: 'все файлы на месте. Финальная проверка: node ' + script('audit.mjs') + ' --root ' + ROOT + ', затем чек-лист сдачи из SKILL.md' }
+  return { stage: 'done', text: 'все файлы на месте. Пересобери карту после финиша (node ' + script('build-index.mjs') + ' --root ' + R + ') и финальная проверка: node ' + script('audit.mjs') + ' --root ' + R + ', затем чек-лист сдачи из SKILL.md' }
 }
 
 const next = nextStep()
@@ -256,6 +264,6 @@ if (args.write) {
 } else {
   const pending = topicRows.filter(r => TOPIC_RANK[r.derived] > TOPIC_RANK[r.recorded]).length +
     synthRows.filter(r => SYNTH_RANK[r.derived] > SYNTH_RANK[r.recorded]).length
-  if (pending) console.log('Статусов отстаёт от диска: ' + pending + '. Записать: node ' + script('status.mjs') + ' --root ' + ROOT + ' --write (или любой следующий render-tasks.mjs)')
+  if (pending) console.log('Статусов отстаёт от диска: ' + pending + '. Записать: node ' + script('status.mjs') + ' --root ' + R + ' --write (или любой следующий render-tasks.mjs)')
 }
 console.log('Дальше — ' + next.text)

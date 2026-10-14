@@ -1,6 +1,6 @@
 {
   "type": "object",
-  "description": "Возврат агента, который пишет один файл движка: свод, навигатор банка фактов, METHOD.md, AGENT.md. Пишется агентом в state/results/<label>.json и возвращается тем же объектом.",
+  "description": "Возврат агента, который пишет один файл движка: разведку brief/RECON.md, свод, навигатор банка фактов, METHOD.md, AGENT.md. Пишется агентом в state/results/<label>.json и возвращается тем же объектом. Что именно класть в каждое поле, уточняет файл задачи.",
   "additionalProperties": false,
   "properties": {
     "path": {
@@ -13,12 +13,14 @@
     },
     "sections": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "description": "список разделов файла в порядке следования"
     },
     "factsCarried": {
       "type": "number",
-      "description": "сколько отдельных фактов с цифрами перенесено из отчётов"
+      "description": "сколько отдельных фактов с цифрами в файле: перенесено из корпуса, вынесено с адресом или найдено (разведка); как считать — в файле задачи"
     },
     "approxWords": {
       "type": "number",
@@ -26,9 +28,18 @@
     },
     "openIssues": {
       "type": "array",
-      "items": { "type": "string" },
-      "description": "чего в отчётах не хватило для этого документа; пустой массив, если хватило всего"
+      "items": {
+        "type": "string"
+      },
+      "description": "открытые вопросы: чего не хватило для документа, а у разведки — вопросы заказчику; пустой массив, если открытого нет"
     }
   },
-  "required": ["path", "summary", "sections", "factsCarried", "approxWords", "openIssues"]
+  "required": [
+    "path",
+    "summary",
+    "sections",
+    "factsCarried",
+    "approxWords",
+    "openIssues"
+  ]
 }
