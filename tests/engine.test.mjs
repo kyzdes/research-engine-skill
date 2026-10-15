@@ -494,14 +494,14 @@ const verified = (root, slug) => {
   fs.writeFileSync(path.join(root, 'state', 'results', 'verify__' + slug + '.json'), JSON.stringify({ wordsBefore: 1, wordsAfter: 5 }))
 }
 
-test('render-tasks: первая партия и команда Codex — только непрогнанные темы, по меткам; верификация в Codex отдельным прогоном', () => {
+test('render-tasks: первая партия и команда Codex — только непрогнанные темы, по меткам; верификатор в Codex идёт следом сам', () => {
   const root = makeEngine()
   for (const t of ['01-alpha', '02-beta', '03-gamma', '04-delta']) verified(root, t)
   const r = run('render-tasks.mjs', ['--root', root, '--stage', 'research'])
   assert.equal(r.code, 0, r.err)
   assert.match(r.out, /"labels":\["05-epsilon"\]/)
   assert.match(r.out, /--stage research --labels research__05-epsilon --engine codex/)
-  assert.match(r.out, /--stage verify --labels verify__05-epsilon --engine codex/)
+  assert.match(r.out, /верификатор каждой темы встаёт в очередь следом/)
   assert.doesNotMatch(r.out.slice(r.out.indexOf('Дальше:')), /01-alpha/)
   assert.ok(tasks(root).includes('verify__05-epsilon.md'))
 })
@@ -692,7 +692,7 @@ test('fanout: веб-поиск только на recon/research/verify; зак�
   const root = makeEngine()
   assert.equal(run('render-tasks.mjs', ['--root', root, '--stage', 'synth']).code, 0)
   const d = run('fanout.mjs', ['--root', root, '--labels', 'synth__field-spec', '--dry-run'])
-  assert.match(d.out, /tools\.web_search=false/)
+  assert.match(d.out, /web_search="disabled"/)
   assert.doesNotMatch(d.out, /Веб-поиск тебе включён/)
   assert.match(d.out, /Веб-поиск на этой стадии не нужен/)
   const miss = run('fanout.mjs', ['--root', root, '--labels', 'verify__01-alpha,method__method'])
@@ -728,7 +728,7 @@ test('status: команды Codex рядом с Workflow; финиш — METHOD
   const root = makeEngine()
   const st = run('status.mjs', ['--root', root])
   assert.match(st.out, /Codex: node \S+fanout\.mjs --root \S+ --stage research --labels research__01-alpha/)
-  assert.match(st.out, /--stage verify --labels verify__01-alpha/)
+  assert.match(st.out, /research__01-alpha[^\n]*верификатор следом сам/)
   for (const t of TOPICS) verified(root, t)
   for (const f of ['FIELD-SPEC', 'VERDICTS', 'FACTS-BANK-a', 'FACTS-BANK-b', 'FACTS-BANK', 'GAPS']) fs.writeFileSync(path.join(root, 'synthesis', f + '.md'), '# ' + f + '\n\nтекст\n')
   fs.writeFileSync(path.join(root, 'METHOD.md'), '# M\n\nтекст\n')
@@ -873,4 +873,113 @@ test('render-tasks: одиночная стадия с готовым файло
   const r = run('render-tasks.mjs', ['--root', root, '--stage', 'method'])
   assert.equal(r.code, 0, r.err)
   assert.match(r.out, /все задачи стадии method уже сделаны/)
+})
+
+
+// ---------------------------------------------------------------- Codex: маршрут, цепочка, расход, сбои
+
+// Поддельный codex: пишет годный по схеме результат задачи (метка — из пути результата в промпте),
+// отдаёт событие turn.completed с usage. FAKE_MODE: ok | limit | flaky (первый запуск — ENOTFOUND).
+function fakeCodex() {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 're-codex-'))
+  const p = path.join(bin, 'codex')
+  fs.writeFileSync(p, '#!' + process.execPath + '\n' + String.raw`
+const fs = require('fs'); const path = require('path')
+const argv = process.argv.slice(2); const prompt = argv[argv.length - 1]
+const m = prompt.match(/(\/[^\s]*state\/results\/([a-z]+)__([^\s]+)\.json)/)
+const mode = process.env.FAKE_MODE || 'ok'
+const log = process.env.FAKE_LOG; if (log) fs.appendFileSync(log, (m ? m[2] + '__' + m[3] : '?') + ' ' + (argv[argv.indexOf('-m') + 1] || '') + '\n')
+if (mode === 'limit') { process.stderr.write("ERROR: You've hit your usage limit. Try again later.\n"); process.exit(1) }
+if (mode === 'flaky') { const c = process.env.FAKE_COUNTER; const n = fs.existsSync(c) ? Number(fs.readFileSync(c, 'utf8')) : 0; fs.writeFileSync(c, String(n + 1)); if (n === 0) { process.stderr.write('stream error: getaddrinfo ENOTFOUND api.openai.com\n'); process.exit(1) } }
+const [file, prefix, slug] = [m[1], m[2], m[3]]
+const res = prefix === 'research' ? { reportPath: '/r', topic: slug, headline: 'h', keyFindings: [], hardNumbers: [], disputes: [], unverified: [], notCovered: [], sourceCount: 1, approxWords: 10 }
+  : prefix === 'verify' ? { topic: slug, coverageVerdict: 'full', checkedClaims: [], corrections: [], additions: [], stillMissing: [], wordsBefore: 10, wordsAfter: 20 }
+  : { path: '/f', summary: 's', sections: [], factsCarried: 0, approxWords: 1, openIssues: [] }
+fs.writeFileSync(file, JSON.stringify(res))
+const o = argv[argv.indexOf('-o') + 1]; fs.writeFileSync(o, JSON.stringify(res))
+process.stdout.write(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1000, cached_input_tokens: 400, output_tokens: 200 } }) + '\n')
+`)
+  fs.chmodSync(p, 0o755)
+  return bin
+}
+
+test('Codex: маршрут моделей по стадиям, web_search live/disabled, верификатор в dry-run следом', () => {
+  const root = makeEngine()
+  assert.equal(run('render-tasks.mjs', ['--root', root, '--stage', 'research', '--labels', '01-alpha']).code, 0)
+  const d = run('fanout.mjs', ['--root', root, '--stage', 'research', '--labels', '01-alpha', '--dry-run'])
+  assert.equal(d.code, 0, d.err)
+  const blocks = d.out.split('\n\n')
+  const res = blocks.find(b => b.startsWith('# research__01-alpha'))
+  const ver = blocks.find(b => b.startsWith('# verify__01-alpha'))
+  assert.match(res, /-m gpt-6\.1-sol/); assert.match(res, /model_reasoning_effort="high"/); assert.match(res, /web_search="live"/)
+  assert.match(ver, /встанет в очередь после успешного ресерча/); assert.match(ver, /-m gpt-6-astra/)
+  assert.equal(readEngine(root).codexModels.verify, 'gpt-6-astra')
+  const nv = run('fanout.mjs', ['--root', root, '--stage', 'research', '--labels', '01-alpha', '--dry-run', '--no-verify'])
+  assert.doesNotMatch(nv.out, /# verify__01-alpha/)
+})
+
+test('Codex: партия ресерча гонит верификатора следом, расход пишется в runs и журнал сам', () => {
+  const root = makeEngine()
+  assert.equal(run('render-tasks.mjs', ['--root', root, '--stage', 'research', '--labels', '01-alpha,02-beta']).code, 0)
+  for (const t of ['01-alpha', '02-beta']) fs.writeFileSync(path.join(root, 'reports', t + '.md'), '# ' + t + '\n\nтекст отчёта\n')
+  const bin = fakeCodex(); const log = path.join(path.dirname(root), 'calls.log')
+  const r = run('fanout.mjs', ['--root', root, '--stage', 'research', '--labels', '01-alpha,02-beta', '--retries', '0'], { PATH: bin + path.delimiter + process.env.PATH, FAKE_LOG: log })
+  assert.equal(r.code, 0, r.out + r.err)
+  const calls = fs.readFileSync(log, 'utf8').trim().split('\n')
+  assert.equal(calls.length, 4)
+  for (const t of ['01-alpha', '02-beta']) {
+    const ri = calls.findIndex(c => c.startsWith('research__' + t)), vi = calls.findIndex(c => c.startsWith('verify__' + t))
+    assert.ok(ri >= 0 && vi > ri, 'верификатор после ресерча: ' + calls.join(' | '))
+  }
+  assert.ok(calls.filter(c => c.startsWith('verify__')).every(c => c.endsWith('gpt-6-astra')))
+  const runs = readEngine(root).runs
+  const last = runs[runs.length - 1]
+  assert.deepEqual([last.stage, last.host, last.agents, last.tokens], ['research', 'codex', 4, 4800])
+  assert.match(fs.readFileSync(path.join(root, 'state', 'run-log.md'), 'utf8'), /4\/4 успешно, 4 800 токенов/)
+})
+
+test('Codex: исчерпанный лимит останавливает новые задачи; сетевой сбой повторяется с паузой', () => {
+  const root = makeEngine()
+  assert.equal(run('render-tasks.mjs', ['--root', root, '--stage', 'synth']).code, 0)
+  const bin = fakeCodex(); const env = { PATH: bin + path.delimiter + process.env.PATH, RE_FANOUT_BACKOFF_MS: '10,10' }
+  const lim = run('fanout.mjs', ['--root', root, '--stage', 'synth', '--concurrency', '1', '--retries', '2'], { ...env, FAKE_MODE: 'limit' })
+  assert.equal(lim.code, 1)
+  assert.match(lim.err, /лимит хоста исчерпан/)
+  assert.equal((lim.out.match(/^→ /gm) || []).length, 1, 'после лимита новые задачи не запускаются')
+  assert.match(lim.out, /после сброса лимита/)
+  const counter = path.join(path.dirname(root), 'counter')
+  const fl = run('fanout.mjs', ['--root', root, '--labels', 'synth__field-spec', '--retries', '0'], { ...env, FAKE_MODE: 'flaky', FAKE_COUNTER: counter })
+  assert.equal(fl.code, 0, fl.out + fl.err)
+  assert.match(fl.out, /сбой сети или перегрузка[^\n]*пауза 0 с и повтор/)
+})
+
+test('режим субагентов: --print-prompts печатает промпты задач и верификатора следом, ничего не запуская', () => {
+  const root = makeEngine()
+  assert.equal(run('render-tasks.mjs', ['--root', root, '--stage', 'research', '--labels', '01-alpha']).code, 0)
+  const p = run('fanout.mjs', ['--root', root, '--stage', 'research', '--labels', '01-alpha', '--print-prompts'])
+  assert.equal(p.code, 0, p.err)
+  assert.match(p.out, /=== research__01-alpha ===\nТы выполняешь одну задачу/)
+  assert.match(p.out, /=== verify__01-alpha · после ресерча темы ===/)
+  assert.equal(fs.readdirSync(path.join(root, 'state', 'logs')).length, 0, 'ничего не запускалось')
+})
+
+test('claude: расход берётся из usage конверта и пишется в runs', () => {
+  const root = makeEngine()
+  assert.equal(run('render-tasks.mjs', ['--root', root, '--stage', 'synth']).code, 0)
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 're-claude-'))
+  fs.writeFileSync(path.join(bin, 'claude'), '#!' + process.execPath + '\nconst fs=require("fs");const a=process.argv[process.argv.length-1];const m=a.match(/(\\/[^\\s]*state\\/results\\/[^\\s]+\\.json)/);' +
+    'fs.writeFileSync(m[1],JSON.stringify({path:"/x",summary:"s",sections:[],factsCarried:0,approxWords:1,openIssues:[]}));' +
+    'process.stdout.write(JSON.stringify({result:"{}",usage:{input_tokens:10,output_tokens:20,cache_read_input_tokens:300,cache_creation_input_tokens:70}}))\n')
+  fs.chmodSync(path.join(bin, 'claude'), 0o755)
+  const r = run('fanout.mjs', ['--root', root, '--labels', 'synth__field-spec', '--engine', 'claude', '--retries', '0'], { PATH: bin + path.delimiter + process.env.PATH })
+  assert.equal(r.code, 0, r.out + r.err)
+  const last = readEngine(root).runs.slice(-1)[0]
+  assert.deepEqual([last.stage, last.host, last.tokens], ['synth', 'claude', 400])
+})
+
+test('audit: диапазон с минусом и заглушка ссылки [S…] — не следы сжатия', () => {
+  const root = makeEngine()
+  writeReport(root, '01-alpha', '# a\n\nОкно недели −8…−1 до правки; ссылки [S…] — по нумерации отчёта. Список и т.д.\n')
+  const c = audit(root, 'research').findings.filter(x => x.code === 'compression').map(x => x.message)
+  assert.deepEqual(c, ['след сжатия: «и т.д.» — разверни пункт вместо отсылки'])
 })

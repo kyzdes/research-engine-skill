@@ -11,7 +11,7 @@ import {
   die, isDir, isFile, readText, readJson, countWords, fmt, todayISO,
   normalizeEngine, isGaps, synthStageEntries, appendRunLogRow, toolchainDrift, DEFAULT_FINISH,
   briefFindings, workflowArgs, flushAndExit, diskState, upgradeStatuses, writeEngineJson,
-  estimateCost, TOPIC_RANK, SYNTH_RANK, STAGES, resolveRoot, shq, takeValue, PREFIX_BY_STAGE,
+  estimateCost, TOPIC_RANK, SYNTH_RANK, STAGES, resolveRoot, shq, takeValue, PREFIX_BY_STAGE, recordRun,
 } from './lib/engine.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -88,13 +88,13 @@ const writeOrDie = () => {
 
 let recorded = null
 if (args.record) {
-  recorded = {
-    date: todayISO(), stage: args.record, host: args.host, labels: args.labels ? args.labels.split(',').map(s => s.trim()).filter(Boolean) : [],
-    agents: args.agents, tokens: args.tokens || null, minutes: args.minutes || null, note: args.note || '',
-  }
-  raw.runs = Array.isArray(raw.runs) ? raw.runs : []
-  raw.runs.push(recorded)
-  writeOrDie()
+  try {
+    recorded = recordRun(ROOT, {
+      stage: args.record, host: args.host, labels: args.labels ? args.labels.split(',').map(s => s.trim()).filter(Boolean) : [],
+      agents: args.agents, tokens: args.tokens, minutes: args.minutes, note: args.note,
+    })
+  } catch (e) { die('не удалось записать ' + enginePath + ': ' + e.message, 1) }
+  raw.runs = (readJson(enginePath) || raw).runs
   try {
     appendRunLogRow(ROOT, [recorded.date, recorded.stage, recorded.host, recorded.labels.join(', ') || '—',
       recorded.agents + ' агентов' + (recorded.tokens ? ', ' + fmt(recorded.tokens) + ' токенов' : '') + (recorded.minutes ? ', ' + recorded.minutes + ' мин' : ''),
@@ -162,7 +162,7 @@ function nextStep() {
       stage: 'research', labels: batch,
       text: 'ресерч, партия ' + batch.length + ' из ' + planned.length + ' непрогнанных тем' + busyNote + ':\n    ' +
         render('research', batch) + '\n    ' + wf('research.mjs', 'research', batch) +
-        '\n    ' + codex('research', batch) + ', затем ' + codex('verify', batch).replace(/^Codex: /, ''),
+        '\n    ' + codex('research', batch) + ' (верификатор следом сам)',
     }
   }
   if (busy.length) return { stage: 'wait', labels: busy, text: 'дождись партии: отчёты ещё пишутся — ' + busy.join(', ') }

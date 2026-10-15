@@ -445,6 +445,24 @@ export function estimateCost(raw, state, root) {
   return { rows, agents: rows.reduce((a, r) => a + r.agents, 0), tokens: rows.reduce((a, r) => a + r.tokens, 0) }
 }
 
+// Запись фактического расхода партии в engine.json (runs). Читает файл заново: между стартом
+// партии и её концом его могли переписать render-tasks или status. Возвращает запись.
+export function recordRun(root, rec) {
+  const p = path.join(root, 'engine.json')
+  const raw = readJson(p)
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('engine.json не читается: ' + p)
+  const entry = {
+    date: rec.date || todayISO(), stage: rec.stage, host: rec.host || 'claude',
+    labels: Array.isArray(rec.labels) ? rec.labels : [], agents: Number(rec.agents) || 0,
+    tokens: Number(rec.tokens) > 0 ? Number(rec.tokens) : null, minutes: Number(rec.minutes) > 0 ? Number(rec.minutes) : null,
+    note: rec.note || '',
+  }
+  raw.runs = Array.isArray(raw.runs) ? raw.runs : []
+  raw.runs.push(entry)
+  writeEngineJson(root, raw)
+  return entry
+}
+
 // ---------------------------------------------------------------- модели по стадиям
 
 // Какой модели отдавать задачу. Правило: суждение и проверка — сильнейшей модели (верификатор,
@@ -462,6 +480,19 @@ export const DEFAULT_EFFORTS = {
 }
 export const ROUTE_KEYS = Object.keys(DEFAULT_MODELS)
 
+// Тот же маршрут для Codex: псевдонимы Claude (opus, sonnet) кодексу не годятся. Правило то же —
+// суждение и проверка на frontier-модели, объём и перенос на рабочей лошадке. Имена моделей
+// сверены с каталогом codex-cli 0.159.3 (codex debug models, 15.10.2026): gpt-6-astra —
+// «frontier intelligence», gpt-6.1-sol — «latest workhorse». Без маршрута codex берёт модель
+// и усилие из ~/.codex/config.toml — часто frontier с xhigh на каждом агенте, дорого и медленно.
+// Переопределяется полями codexModels и codexEfforts в engine.json.
+export const CODEX_DEFAULT_MODELS = {
+  recon: 'gpt-6.1-sol', research: 'gpt-6.1-sol', verify: 'gpt-6-astra', synth: 'gpt-6-astra', bank: 'gpt-6.1-sol',
+  merge: 'gpt-6.1-sol', critique: 'gpt-6-astra', method: 'gpt-6-astra', 'agent-doc': 'gpt-6.1-sol',
+}
+export const CODEX_DEFAULT_EFFORTS = { ...DEFAULT_EFFORTS }
+export const HOSTS = ['claude', 'codex']
+
 // Части банка фактов идут отдельным ключом bank: перенос тысяч строк таблиц требует
 // аккуратности, а не суждения, и на сильнейшей модели это дорого без выигрыша. Часть —
 // это запись из раскладки банка (primary/parts навигатора), а не только файл FACTS-BANK-*.
@@ -471,12 +502,16 @@ export function routeKey(stage, synthEntry, syntheses) {
   return isPartOf(parts, synthEntry) || isBankPart(synthEntry) ? 'bank' : stage
 }
 
-export function routeFor(raw, stage, synthEntry) {
+// host — claude (models/efforts) или codex (codexModels/codexEfforts); у каждого свои умолчания.
+export function routeFor(raw, stage, synthEntry, host = 'claude') {
   const key = routeKey(stage, synthEntry, normalizeEngine(raw).syntheses)
   const pick = (o) => (o && typeof o === 'object' && !Array.isArray(o) ? o : {})
-  const m = pick(raw && raw.models)
-  const ef = pick(raw && raw.efforts)
-  return { key, model: String(m[key] || DEFAULT_MODELS[key] || ''), effort: String(ef[key] || DEFAULT_EFFORTS[key] || '') }
+  const codex = host === 'codex'
+  const m = pick(raw && (codex ? raw.codexModels : raw.models))
+  const ef = pick(raw && (codex ? raw.codexEfforts : raw.efforts))
+  const dm = codex ? CODEX_DEFAULT_MODELS : DEFAULT_MODELS
+  const de = codex ? CODEX_DEFAULT_EFFORTS : DEFAULT_EFFORTS
+  return { key, model: String(m[key] || dm[key] || ''), effort: String(ef[key] || de[key] || '') }
 }
 
 // Стадия по метке задачи: research__x → research, method__agent → agent-doc.
