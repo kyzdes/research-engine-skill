@@ -47,12 +47,14 @@ claude plugin marketplace update claude-skills
 claude plugin update research-engine@claude-skills
 ```
 
-Codex:
+Codex (проверено на codex-cli 0.159.3):
 
 ```
-codex plugin marketplace add https://github.com/kyzdes/claude-skills
-codex plugin add research-engine
+codex plugin marketplace add https://github.com/kyzdes/claude-skills.git
+codex plugin add research-engine@claude-skills
 ```
+
+После установки открой новую задачу Codex, чтобы он подхватил скилл. В Codex стадии гоняет `fanout.mjs`: процесс `codex exec` на задачу, маршрут моделей из `codexModels` в `engine.json` (`gpt-6-astra` на верификации, сводах, критике и методике, `gpt-6.1-sol` на остальном), верификатор следом за ресерчем, расход партии пишется сам. Запасной путь для приложения Codex — режим субагентов (`fanout.mjs --print-prompts`), см. SKILL.md, «Прогон».
 
 ## Как гонять
 
@@ -60,8 +62,8 @@ codex plugin add research-engine
 /engine new <тема>      бриф: разбор запроса, разведка, вопросы о работе базы, материалы, контрольные вопросы
 /engine brief           готов ли бриф и какие контрольные вопросы не закрыты темами
 /engine plan            декомпозиция: prompts/, synthesis-spec/, карта «тема → свод»
-/engine run research    отчёты партиями по 3–4 темы; в Claude Code следом за ресерчером идёт верификатор
-/engine run verify      только верификация: в Codex после ресерча или повторно
+/engine run research    отчёты партиями по 3–4 темы; следом за ресерчером темы идёт её верификатор
+/engine run verify      только верификация: повтор упавшего или не нарастившего отчёт верификатора
 /engine run synth       своды
 /engine run merge       навигатор банка фактов, если банк собран частями
 /engine run critique    GAPS.md

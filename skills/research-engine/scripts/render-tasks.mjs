@@ -525,7 +525,7 @@ if (argv.dryRun) {
 } else if (STAGE === 'research') {
   console.log('Дальше: партия ' + shorts.length + ' из ' + pending.length + (argv.labels.length ? '' : ' непрогнанных') + ' — ' + wf('research.mjs') + ' с args ' + wfArgs +
     ' (верификатор идёт следом сам, его задачи уже отрендерены; следующие партии — те же args с другими labels).')
-  console.log('В Codex ресерч и верификация — два прогона: ' + fanout('research', shorts) + ', затем ' + fanout('verify', shorts) + '.')
+  console.log('В Codex: ' + fanout('research', shorts) + ' — верификатор каждой темы встаёт в очередь следом за её ресерчем, модели — из codexModels в engine.json.')
   console.log(afterBatch)
 } else if (STAGE === 'verify') {
   console.log('Дальше: ' + wf('research.mjs') + ' с args ' + wfArgs + ' — только верификатор, отчёт не пишется заново; либо ' + fanout('verify', shorts) + '. ' + afterBatch)

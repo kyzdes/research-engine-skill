@@ -13,6 +13,7 @@ import {
   defaultSynthFile, isGaps, isBankNav, PROFILE_NORM, DEFAULT_FINISH, DEFAULT_WORDS,
   strList, normalizeBrief, briefFindings, renderBriefMd, DEFAULT_MODELS, DEFAULT_EFFORTS, ROUTE_KEYS,
   TOPIC_RANK, resolveRoot, shq, takeValue, labelProblem, matrixFindings, appendRunLogRow,
+  CODEX_DEFAULT_MODELS, CODEX_DEFAULT_EFFORTS,
 } from './lib/engine.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -56,6 +57,7 @@ answers.json — объект с любым подмножеством поле�
           acceptance:[{ id, question, job }], assumptions, constraints, known,
           inputs:[{ ref, kind, use, trust }], sources { must, avoid }, freshness, openQuestions },
   models { <стадия>: opus|sonnet|haiku|<id> }, efforts { <стадия>: low|medium|high|xhigh|max }
+  codexModels { <стадия>: gpt-6-astra|gpt-6.1-sol|<id> }, codexEfforts { <стадия>: low|medium|high|xhigh }
          стадии: ${ROUTE_KEYS.join(', ')} — bank это части банка фактов,
   topics [ { slug, title, what, feeds:[label], answers:[A1], status } ],
   syntheses [ { label, file, title, primary:[slug], secondary:[slug], parts:[label], when, status } ]
@@ -116,7 +118,7 @@ function loadAnswers(file) {
 const KNOWN_ANSWER_KEYS = new Set([
   'root', 'slug', 'title', 'language', 'profile', 'finish', 'today', 'createdAt',
   'mission', 'perimeter', 'targetWords', 'topics', 'syntheses', 'version', 'runs', 'brief',
-  'models', 'efforts',
+  'models', 'efforts', 'codexModels', 'codexEfforts',
 ])
 
 // ---------------------------------------------------------------- нормализация состояния
@@ -406,6 +408,9 @@ const pickRoute = (defaults, prev, gv, name) => {
 }
 const models = pickRoute(DEFAULT_MODELS, base.models, answers.models, 'models')
 const efforts = pickRoute(DEFAULT_EFFORTS, base.efforts, answers.efforts, 'efforts')
+// Маршрут для Codex — отдельные поля: имена моделей у хостов разные.
+const codexModels = pickRoute(CODEX_DEFAULT_MODELS, base.codexModels, answers.codexModels, 'codexModels')
+const codexEfforts = pickRoute(CODEX_DEFAULT_EFFORTS, base.codexEfforts, answers.codexEfforts, 'codexEfforts')
 
 // Слаг темы и метка свода — части имён файлов задач: с плохой меткой рендер упадёт
 // посреди стадии, поэтому это ошибка сразу, а не предупреждение.
@@ -513,6 +518,8 @@ const engineJson = {
   brief,
   models,
   efforts,
+  codexModels,
+  codexEfforts,
   targetWords,
   topics,
   syntheses,

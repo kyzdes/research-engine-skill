@@ -4,16 +4,18 @@
 // отдельный процесс агента, держит лимит параллелизма, пишет логи и сырые возвраты.
 // Node 18+, ESM, без зависимостей.
 //
-// Флаги хостов сверены на машине сборки 22.08.2026:
-//   codex-cli 0.146.0 — codex exec: --json, --output-schema <FILE>, -o/--output-last-message <FILE>,
+// Флаги хостов сверены на машине сборки 15.10.2026:
+//   codex-cli 0.159.3 — codex exec: --json, --output-schema <FILE>, -o/--output-last-message <FILE>,
 //     -C/--cd <DIR>, --skip-git-repo-check, -s/--sandbox <read-only|workspace-write|danger-full-access>,
 //     -m/--model, -c/--config <key=value>, --color <always|never|auto>, --strict-config.
-//     Веб-поиск: у codex exec НЕТ флага --search (он есть только у интерактивного codex),
-//     включается ключом конфига  -c tools.web_search=true .
-//     Проверено: с --strict-config неизвестный ключ падает с «unknown configuration field»,
-//     а tools.web_search проходит; БЕЗ --strict-config опечатка в ключе глотается молча
-//     и агент уходит в ресерч без интернета. Поэтому --strict-config включён по умолчанию.
-//   claude — -p/--print, --output-format json, --permission-mode bypassPermissions,
+//     Веб-поиск: флага --search у codex exec нет, включается ключом конфига
+//     -c web_search="live" (значения disabled | cached | indexed | live; проверено событиями
+//     web_search в --json). Прежний ключ tools.web_search=true пока принимается, но он устаревший.
+//     С --strict-config неизвестный ключ или значение падает громко («Error loading config.toml»),
+//     поэтому --strict-config включён по умолчанию.
+//     Расход: --json отдаёт событие turn.completed с usage (input_tokens включает cached_input_tokens,
+//     output_tokens включает reasoning_output_tokens) — по нему партия пишет runs сама.
+//   claude — -p/--print, --output-format json (в конверте — usage), --permission-mode bypassPermissions,
 //     --add-dir <directories...> (variadic: забирает все следующие позиционные аргументы,
 //     поэтому промпт нельзя ставить сразу после него — см. buildCommand),
 //     --model, --effort <low|medium|high|xhigh|max>. Флага веб-поиска нет:
@@ -26,7 +28,7 @@ import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import {
   STAGES, PREFIX_BY_STAGE, normalizeEngine, stageLabels, appendRunLogRow, todayISO, routeFor, stageOfLabel, flushAndExit,
-  syncStatuses, shq, resolveRoot, lawFor, schemaProblems,
+  syncStatuses, shq, resolveRoot, lawFor, schemaProblems, recordRun, fmt,
 } from './lib/engine.mjs'
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
@@ -67,14 +69,20 @@ const HELP = `fanout.mjs — исполнитель стадии движка р
 Опции:
   --engine codex|claude    чем поднимать агента (по умолчанию codex)
   --concurrency <n>        сколько агентов одновременно (по умолчанию 3)
-  --model <m>              модель агента на все задачи. Без флага на хосте claude модель
-                           берётся по стадии из models в engine.json (верификатор,
-                           плейбуки, критик, методика — opus; ресерч, части банка,
-                           навигатор — sonnet); на codex — настройка хоста
-  --effort <level>         усилие рассуждения; для claude это --effort, без флага —
-                           по стадии из efforts в engine.json
-                           (low|medium|high|xhigh|max), для codex это
-                           -c model_reasoning_effort="<level>"
+  --model <m>              модель агента на все задачи, сильнее маршрута. Без флага модель
+                           берётся по стадии из engine.json: на claude — models (верификатор,
+                           своды, критик, методика — opus; разведка, ресерч, части банка,
+                           навигатор, AGENT.md — sonnet), на codex — codexModels (то же
+                           правило: gpt-6-astra и gpt-6.1-sol)
+  --effort <level>         усилие рассуждения, сильнее маршрута; без флага — efforts или
+                           codexEfforts из engine.json. claude: --effort
+                           (low|medium|high|xhigh|max); codex: -c model_reasoning_effort
+                           (low|medium|high|xhigh)
+  --no-verify              на стадии research не запускать верификатора следом. По умолчанию
+                           после успешного ресерча темы её верификатор встаёт в ту же очередь —
+                           как в Workflow-исполнителе research.mjs
+  --no-record              не записывать расход партии в engine.json (runs). По умолчанию
+                           токены берутся из ответа хоста и пишутся сами
   --retries <n>            повторов после первого провала (по умолчанию 1)
   --timeout-sec <n>        таймаут на процесс (по умолчанию 5400)
   --web-search on|off      веб-поиск агенту на стадиях recon, research и verify (по умолчанию
@@ -90,11 +98,18 @@ const HELP = `fanout.mjs — исполнитель стадии движка р
   --skip-done              пропустить задачи, у которых уже есть state/results/<label>.json
   --allow-missing-result   не считать провалом отсутствие state/results/<label>.json
   --dry-run                напечатать команды целиком и ничего не запускать
+  --print-prompts          напечатать промпты задач и выйти — для режима субагентов Codex
+                           (spawn_agent): тот же контракт, что у процесса, без запуска
   --help                   эта справка
 
 Почему параллелизм 3 по умолчанию: девять тяжёлых агентов разом выжигают лимит
 сессии за считанные минуты (замер на сборке aso-engine: 2,2 млн токенов за пять
 минут). Партии по 3-4 — правило, а не осторожность.
+
+Сбои хоста: исчерпанный лимит аккаунта («usage limit», «session limit») останавливает
+запуск новых задач — повтор бессмыслен до сброса, в конце печатается команда продолжения.
+Сетевые сбои и перегрузка (ENOTFOUND, ECONNRESET, 429, 5xx, «overloaded») повторяются
+с паузой 30 с, 2 мин, 5 мин сверх --retries.
 
 Примеры:
   node fanout.mjs --root ~/Desktop/Projects/skills/x-engine --stage research --dry-run
@@ -127,6 +142,9 @@ function parseArgs(argv) {
     skipDone: false,
     allowMissingResult: false,
     dryRun: false,
+    verify: true,
+    record: true,
+    printPrompts: false,
   }
   const need = (i, name) => {
     const v = argv[i + 1]
@@ -162,6 +180,9 @@ function parseArgs(argv) {
       case '--skip-done': o.skipDone = true; break
       case '--allow-missing-result': o.allowMissingResult = true; break
       case '--dry-run': o.dryRun = true; break
+      case '--no-verify': o.verify = false; break
+      case '--no-record': o.record = false; break
+      case '--print-prompts': o.printPrompts = true; break
       default: fail('неизвестный флаг ' + a + '. Справка: --help')
     }
   }
@@ -285,13 +306,12 @@ function taskPrompt(root, label, opts) {
 
 // ---------------------------------------------------------------- команды
 
-// Маршрут задачи: флаг командной строки сильнее engine.json. Псевдонимы моделей Claude (opus,
-// sonnet, haiku) кодексу не годятся, поэтому на codex маршрут из engine.json не подставляется.
+// Маршрут задачи: флаг командной строки сильнее engine.json. У каждого хоста свой маршрут:
+// models/efforts для claude, codexModels/codexEfforts для codex (имена моделей у них разные).
 function routeOfJob(label, opts, engine) {
-  if (opts.engine !== 'claude') return { model: opts.model, effort: opts.effort }
   const stage = stageOfLabel(label)
   const entry = stage === 'synth' ? engine.syntheses.find(s => 'synth__' + s.label === label) : null
-  const r = routeFor(engine.raw, stage, entry)
+  const r = routeFor(engine.raw, stage, entry, opts.engine)
   return { model: opts.model || r.model, effort: opts.effort || r.effort }
 }
 
@@ -315,11 +335,11 @@ function buildCommand(label, opts, root, route) {
     // Веб-поиск у codex exec задаётся ключом конфига, флага --search у exec нет.
     // --strict-config превращает опечатку в ключе в громкую ошибку вместо тихого «без интернета».
     if (opts.strictConfig) args.push('--strict-config')
-    args.push('-c', 'tools.web_search=' + (opts.webSearch && isWebJob(label) ? 'true' : 'false'))
+    args.push('-c', 'web_search="' + (opts.webSearch && isWebJob(label) ? 'live' : 'disabled') + '"')
     if (route.model) args.push('-m', route.model)
     if (route.effort) args.push('-c', 'model_reasoning_effort="' + route.effort + '"')
     args.push(prompt)
-    return { cmd: 'codex', args, rawPath, logPath, schema, captureStdout: false }
+    return { cmd: 'codex', args, rawPath, logPath, schema, captureStdout: true }
   }
 
   // claude: без --output-schema (§6) — структурированный результат агент кладёт на диск сам.
@@ -359,6 +379,16 @@ function resultStamp(p) {
   try { return fs.statSync(p).mtimeMs } catch (e) { return 0 }
 }
 
+// Сбои хоста. Лимит аккаунта до сброса не лечится повтором — новые задачи не запускаем.
+// Сеть и перегрузка лечатся паузой. Классифицируется только текст ошибки (stderr, события
+// error у codex, конверт is_error у claude), а не содержимое ответа: ресерчер про Apple Ads
+// законно пишет «rate limit» в отчёте.
+const LIMIT_RE = /usage limit|session limit|hit your [a-z ]*limit|quota (?:exceeded|exhausted)|insufficient_quota|out of credits|credit balance is too low/i
+const TRANSIENT_RE = /ENOTFOUND|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|stream disconnected|network error|can'?t reach the api|fetch failed|too many requests|rate.?limit|overloaded|temporarily unavailable|\b(?:429|500|502|503|504|529)\b/i
+const BACKOFF_MS = String(process.env.RE_FANOUT_BACKOFF_MS || '30000,120000,300000').split(',').map(Number).filter(n => n >= 0)
+const classify = (text) => (!text ? '' : LIMIT_RE.test(text) ? 'limit' : TRANSIENT_RE.test(text) ? 'transient' : '')
+const sleep = (ms) => new Promise(r => setTimeout(r, ms))
+
 function runAttempt(job, opts, attempt) {
   return new Promise(resolve => {
     const started = Date.now()
@@ -375,7 +405,7 @@ function runAttempt(job, opts, attempt) {
       try { fs.rmSync(job.rawPath, { force: true }) } catch (e) { /* нечего убирать */ }
       fd = fs.openSync(job.logPath, attempt === 1 ? 'w' : 'a')
     } catch (e) {
-      return resolve({ ok: false, code: null, reason: 'не готовится state/: ' + e.message, sec: 0 })
+      return resolve({ ok: false, code: null, reason: 'не готовится state/: ' + e.message, sec: 0, tokens: 0 })
     }
     const write = s => { try { fs.writeSync(fd, s) } catch (e) { /* лог не критичен */ } }
     write('\n===== попытка ' + attempt + ' · ' + new Date().toISOString() + ' =====\n' + renderCommand(job) + '\n\n')
@@ -390,11 +420,14 @@ function runAttempt(job, opts, attempt) {
       })
     } catch (e) {
       try { fs.closeSync(fd) } catch (e2) { /* уже закрыт */ }
-      return resolve({ ok: false, code: null, reason: 'не запустился: ' + e.message, sec: 0 })
+      return resolve({ ok: false, code: null, reason: 'не запустился: ' + e.message, sec: 0, tokens: 0 })
     }
 
     running.add(child)
-    let stdout = ''
+    let stdout = ''        // claude: один JSON-конверт целиком
+    let lineBuf = ''       // codex: JSONL событий, разбирается построчно и не копится
+    let errText = ''       // только текст ошибок — по нему классифицируется сбой
+    let tokens = 0
     let timedOut = false
     let configError = ''
 
@@ -404,9 +437,24 @@ function runAttempt(job, opts, attempt) {
         if (text.includes(mark)) { configError = text.split('\n').find(l => l.includes(mark)).trim(); return }
       }
     }
+    const codexEvent = (line) => {
+      if (!line.trim()) return
+      let e
+      try { e = JSON.parse(line) } catch (err) { return }
+      if (e.type === 'turn.completed' && e.usage) tokens += (Number(e.usage.input_tokens) || 0) + (Number(e.usage.output_tokens) || 0)
+      if (e.type === 'error' || e.type === 'turn.failed') errText = (errText + '\n' + JSON.stringify(e.error || e.message || e)).slice(-16000)
+    }
 
-    child.stdout.on('data', d => { const s = d.toString(); write(s); sniff(s); if (job.captureStdout) stdout += s })
-    child.stderr.on('data', d => { const s = d.toString(); write(s); sniff(s) })
+    child.stdout.on('data', d => {
+      const s = d.toString(); write(s); sniff(s)
+      if (job.cmd === 'codex') {
+        lineBuf += s
+        const lines = lineBuf.split('\n')
+        lineBuf = lines.pop()
+        for (const l of lines) codexEvent(l)
+      } else if (job.captureStdout) stdout += s
+    })
+    child.stderr.on('data', d => { const s = d.toString(); write(s); sniff(s); errText = (errText + s).slice(-16000) })
 
     const timer = setTimeout(() => {
       timedOut = true
@@ -424,7 +472,8 @@ function runAttempt(job, opts, attempt) {
       settled = true
       clearTimeout(timer)
       running.delete(child)
-      write('\n[fanout] ' + (payload.ok ? 'успех' : 'провал: ' + payload.reason) + ' · ' + payload.sec + ' с\n')
+      payload.tokens = tokens
+      write('\n[fanout] ' + (payload.ok ? 'успех' : 'провал: ' + payload.reason) + ' · ' + payload.sec + ' с' + (tokens ? ' · ' + tokens + ' токенов' : '') + '\n')
       try { fs.closeSync(fd) } catch (e) { /* уже закрыт */ }
       resolve(payload)
     }
@@ -441,17 +490,26 @@ function runAttempt(job, opts, attempt) {
 
     child.on('close', (code, signal) => {
       const sec = Math.round((Date.now() - started) / 1000)
-      const claudeError = job.captureStdout ? writeClaudeRaw(job, stdout) : false
+      if (lineBuf) codexEvent(lineBuf)
+      let claudeError = false
+      if (job.cmd === 'claude' && job.captureStdout) {
+        const env = writeClaudeRaw(job, stdout)
+        claudeError = env.isError
+        tokens += env.tokens
+        if (env.isError) errText = (errText + '\n' + env.errorText).slice(-16000)
+      }
       if (configError && code !== 0) {
-        fatal = 'codex не принял конфиг: ' + configError +
+        fatal = 'хост не принял конфиг: ' + configError +
           '\n  Это ломает все задачи одинаково. Либо почини ключ, либо запусти с --no-strict-config' +
           ' (тогда веб-поиск может не включиться — на стадиях research и verify это брак).'
         return finish({ ok: false, code, reason: 'конфиг хоста отвергнут: ' + configError, sec, fatal: true })
       }
       if (timedOut) return finish({ ok: false, code, reason: 'таймаут ' + opts.timeoutSec + ' с', sec })
-      if (code !== 0) return finish({ ok: false, code, reason: 'код возврата ' + code + (signal ? ' · сигнал ' + signal : ''), sec })
+      const kind = (code !== 0 || claudeError) ? classify(errText) : ''
+      const tailLine = errText.trim().split('\n').filter(Boolean).pop() || ''
+      if (code !== 0) return finish({ ok: false, code, kind, reason: 'код возврата ' + code + (signal ? ' · сигнал ' + signal : '') + (kind ? ' · ' + (kind === 'limit' ? 'лимит хоста' : 'сбой сети или перегрузка') + ': ' + tailLine.slice(0, 160) : ''), sec })
       // claude умеет завершиться нулём и при этом отдать is_error: true
-      if (claudeError) return finish({ ok: false, code, reason: 'хост вернул is_error: true', sec })
+      if (claudeError) return finish({ ok: false, code, kind, reason: 'хост вернул is_error: true' + (tailLine ? ' · ' + tailLine.slice(0, 160) : ''), sec })
       if (!opts.allowMissingResult) {
         const stampAfter = resultStamp(resultPath)
         if (!stampAfter) {
@@ -475,14 +533,18 @@ function runAttempt(job, opts, attempt) {
 }
 
 // У claude нет флага «положи финальный ответ в файл» — кладём сами из stdout,
-// чтобы сырой возврат лежал на диске одинаково на обоих хостах.
+// чтобы сырой возврат лежал на диске одинаково на обоих хостах. Из конверта же берётся
+// расход: input + output + чтение и запись кэша.
 function writeClaudeRaw(job, stdout) {
-  if (!stdout.trim()) return false
+  const out = { isError: false, tokens: 0, errorText: '' }
+  if (!stdout.trim()) return out
   let payload = stdout
-  let isError = false
   try {
     const env = JSON.parse(stdout)
-    isError = env && env.is_error === true
+    out.isError = Boolean(env && env.is_error === true)
+    const u = (env && env.usage) || {}
+    out.tokens = ['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'].reduce((a, k) => a + (Number(u[k]) || 0), 0)
+    if (out.isError) out.errorText = String(env.result || env.error || '') + (env.api_error_status ? ' ' + env.api_error_status : '')
     if (env && typeof env.result === 'string') {
       try { payload = JSON.stringify(JSON.parse(env.result), null, 2) }
       catch (e) { payload = JSON.stringify(env, null, 2) }
@@ -491,36 +553,61 @@ function writeClaudeRaw(job, stdout) {
     }
   } catch (e) { /* не JSON — кладём как есть */ }
   try { fs.writeFileSync(job.rawPath, payload) } catch (e) { /* диск занят — логи всё равно есть */ }
-  return isError
+  return out
 }
 
 async function runJob(job, opts) {
   let last = null
-  for (let attempt = 1; attempt <= opts.retries + 1; attempt++) {
+  let tokens = 0
+  let transient = 0
+  for (let attempt = 1; ; attempt++) {
     last = await runAttempt(job, opts, attempt)
+    tokens += last.tokens || 0
     last.attempts = attempt
-    if (last.ok || last.fatal) return last
-    if (attempt <= opts.retries) {
-      console.log('  ' + job.label + ': ' + last.reason + ' — повтор ' + attempt + ' из ' + opts.retries)
+    if (last.ok || last.fatal) break
+    if (last.kind === 'limit') {
+      if (!fatal) fatal = 'лимит хоста исчерпан (' + job.label + ': ' + last.reason + '). Новые задачи не запускаются: повтор до сброса лимита бессмыслен'
+      break
     }
+    // Сеть и перегрузка: пауза и повтор сверх --retries, пока не кончатся паузы.
+    if (last.kind === 'transient' && transient < BACKOFF_MS.length && !fatal) {
+      const wait = BACKOFF_MS[transient++]
+      console.log('  ' + job.label + ': ' + last.reason + ' — пауза ' + Math.round(wait / 1000) + ' с и повтор')
+      await sleep(wait)
+      continue
+    }
+    if (attempt - transient > opts.retries || fatal) break
+    console.log('  ' + job.label + ': ' + last.reason + ' — повтор ' + (attempt - transient) + ' из ' + opts.retries)
   }
+  last.tokens = tokens
   return last
 }
 
-async function pool(jobs, opts) {
+// Очередь живая: после успешного ресерча темы её верификатор встаёт в конец той же
+// очереди (onDone). Параллелизм общий, порядок «ресерч → верификация» внутри темы соблюдён.
+async function pool(queue, opts, onDone) {
   const results = new Map()
   let next = 0
+  let active = 0
   const worker = async () => {
-    while (next < jobs.length) {
+    for (;;) {
       if (fatal) return
-      const job = jobs[next++]
-      console.log('→ ' + job.label + ' (запуск ' + next + ' из ' + jobs.length + ')')
+      if (next >= queue.length) {
+        if (!active) return
+        await sleep(100)
+        continue
+      }
+      const job = queue[next++]
+      active++
+      console.log('→ ' + job.label + (job.chained ? ' (следом за ресерчем)' : '') + ' · ' + (job.route.model || 'модель хоста') + ' · запуск ' + next + ' из ' + queue.length)
       const r = await runJob(job, opts)
       results.set(job.label, r)
-      console.log((r.ok ? '✔ ' : '✘ ') + job.label + ' · ' + r.sec + ' с' + (r.ok ? '' : ' · ' + r.reason))
+      console.log((r.ok ? '✔ ' : '✘ ') + job.label + ' · ' + r.sec + ' с' + (r.tokens ? ' · ' + fmt(r.tokens) + ' токенов' : '') + (r.ok ? '' : ' · ' + r.reason))
+      if (r.ok && onDone) onDone(job, queue)
+      active--
     }
   }
-  await Promise.all(Array.from({ length: Math.min(opts.concurrency, jobs.length) }, worker))
+  await Promise.all(Array.from({ length: opts.concurrency }, worker))
   return results
 }
 
@@ -540,8 +627,8 @@ function table(jobs, results) {
       status: r.ok ? 'ок' : 'провал',
       sec: (r.sec || 0) + ' с',
       attempts: String(r.attempts || 0),
+      tokens: r.tokens ? fmt(r.tokens) : '—',
       result: fs.existsSync(resultPath) ? 'есть' : 'нет',
-      raw: fs.existsSync(j.rawPath) ? String(fs.statSync(j.rawPath).size) + ' Б' : '—',
       why: r.ok ? '' : r.reason,
     }
   })
@@ -550,34 +637,65 @@ function table(jobs, results) {
     status: 6,
     sec: Math.max(5, ...rows.map(r => r.sec.length)),
     attempts: 7,
+    tokens: Math.max(7, ...rows.map(r => r.tokens.length)),
     result: 9,
-    raw: Math.max(8, ...rows.map(r => r.raw.length)),
   }
   console.log('')
   console.log(pad('задача', w.label) + '  ' + pad('итог', w.status) + '  ' + pad('время', w.sec) + '  ' +
-    pad('попыток', w.attempts) + '  ' + pad('результат', w.result) + '  ' + pad('raw', w.raw) + '  причина')
-  console.log('-'.repeat(w.label + w.status + w.sec + w.attempts + w.result + w.raw + 20))
+    pad('попыток', w.attempts) + '  ' + pad('токенов', w.tokens) + '  ' + pad('результат', w.result) + '  причина')
+  console.log('-'.repeat(w.label + w.status + w.sec + w.attempts + w.tokens + w.result + 20))
   for (const r of rows) {
     console.log(pad(r.label, w.label) + '  ' + pad(r.status, w.status) + '  ' + pad(r.sec, w.sec) + '  ' +
-      pad(r.attempts, w.attempts) + '  ' + pad(r.result, w.result) + '  ' + pad(r.raw, w.raw) + '  ' + r.why)
+      pad(r.attempts, w.attempts) + '  ' + pad(r.tokens, w.tokens) + '  ' + pad(r.result, w.result) + '  ' + r.why)
   }
 }
+
+// Ключ записи расхода: верификатор, поставленный следом за ресерчем, считается в партии
+// research — так же пишутся партии Workflow (ресерчер и верификатор вместе).
+const runStageOf = (job) => (job.chained ? 'research' : stageOfLabel(job.label))
 
 function appendRunLog(root, opts, jobs, results, sec) {
   const ok = jobs.filter(j => (results.get(j.label) || {}).ok).map(j => j.label)
   const failed = jobs.map(j => j.label).filter(l => !ok.includes(l))
+  const tokens = jobs.reduce((a, j) => a + ((results.get(j.label) || {}).tokens || 0), 0)
   const routes = [...new Set(jobs.map(j => (j.route.model || 'хоста') + '/' + (j.route.effort || 'хоста')))].join(', ')
   const note = 'fanout · параллельно ' + opts.concurrency + ' · модель/усилие ' + routes + ' · веб-поиск ' + (opts.webSearch ? 'вкл' : 'выкл') +
     ' · ' + Math.round(sec / 60) + ' мин' + (failed.length ? ' · упали или не запускались: ' + failed.join(', ') : '')
   // В колонке «Задачи» — только успешные: журнал читают как «что собрано».
   try {
     appendRunLogRow(root, [
-      todayISO(), opts.stage || [...new Set(jobs.map(j => stageOfLabel(j.label)))].join('+'), opts.engine, ok.join(', ') || '—',
-      ok.length + '/' + jobs.length + ' успешно', note,
+      todayISO(), opts.stage || [...new Set(jobs.map(runStageOf))].join('+'), opts.engine, ok.join(', ') || '—',
+      ok.length + '/' + jobs.length + ' успешно' + (tokens ? ', ' + fmt(tokens) + ' токенов' : ''), note,
     ])
   } catch (e) {
     console.error('Не удалось дописать ' + path.join(root, 'state', 'run-log.md') + ': ' + e.message)
   }
+}
+
+// Расход партии в engine.json (runs) — по записи на стадию: по ним status.mjs уточняет
+// оценку оставшейся цены. Пишутся только задачи, которые реально запускались.
+function recordUsage(root, opts, jobs, results, sec) {
+  const groups = new Map()
+  for (const j of jobs) {
+    const r = results.get(j.label)
+    if (!r) continue
+    const k = runStageOf(j)
+    const g = groups.get(k) || { agents: 0, tokens: 0, labels: [] }
+    g.agents++
+    g.tokens += r.tokens || 0
+    if (r.ok) g.labels.push(j.label)
+    groups.set(k, g)
+  }
+  const out = []
+  for (const [stage, g] of groups) {
+    try {
+      out.push(recordRun(root, {
+        stage, host: opts.engine, labels: g.labels, agents: g.agents, tokens: g.tokens,
+        minutes: Math.max(1, Math.round(sec / 60)), note: 'fanout, расход из ответа хоста' + (g.tokens ? '' : ' (хост не отдал токены)'),
+      }))
+    } catch (e) { console.error('Расход партии не записан в engine.json: ' + e.message) }
+  }
+  return out
 }
 
 // ---------------------------------------------------------------- main
@@ -585,9 +703,11 @@ function appendRunLog(root, opts, jobs, results, sec) {
 const opts = parseArgs(process.argv.slice(2))
 const engine = loadEngine(opts.root)
 let labels = normalizeLabels(opts, engine)
+const taskFile = (l) => path.join(opts.root, 'state', 'tasks', l + '.md')
+const resultFile = (l) => path.join(opts.root, 'state', 'results', l + '.json')
 
 // Файлы задач — единственный источник правды. Нет файла — нечего исполнять.
-const missing = labels.filter(l => !fs.existsSync(path.join(opts.root, 'state', 'tasks', l + '.md')))
+const missing = labels.filter(l => !fs.existsSync(taskFile(l)))
 if (missing.length) {
   const byStage = {}
   for (const l of missing) { const st = stageOfLabel(l); (byStage[st] = byStage[st] || []).push(l.split('__').slice(1).join('__')) }
@@ -596,10 +716,32 @@ if (missing.length) {
       'node ' + script('render-tasks.mjs') + ' --root ' + shq(opts.root) + ' --stage ' + st + ' --labels ' + ls.join(',')).join('; '))
 }
 
+// Цепочка «ресерч → верификация»: верификатор темы встаёт в очередь после её ресерча.
+// Явный verify__x рядом с research__x убирается — иначе он стартовал бы раньше отчёта.
+const chain = opts.verify
+const slugOfResearch = (l) => (l.startsWith('research__') ? l.slice('research__'.length) : null)
+if (chain) {
+  const researched = new Set(labels.map(slugOfResearch).filter(Boolean))
+  const dropped = labels.filter(l => l.startsWith('verify__') && researched.has(l.slice('verify__'.length)))
+  if (dropped.length) {
+    labels = labels.filter(l => !dropped.includes(l))
+    console.log('Верификаторы ' + dropped.join(', ') + ' пойдут следом за своим ресерчем, а не параллельно с ним')
+  }
+}
+
+const pendingVerify = [] // верификаторы тем, чей ресерч уже готов (--skip-done)
 if (opts.skipDone) {
   const before = labels.length
-  labels = labels.filter(l => !fs.existsSync(path.join(opts.root, 'state', 'results', l + '.json')))
-  if (before !== labels.length) console.log('Пропущено готовых задач: ' + (before - labels.length) + ' (--skip-done)')
+  const done = labels.filter(l => fs.existsSync(resultFile(l)))
+  labels = labels.filter(l => !done.includes(l))
+  if (chain) {
+    for (const l of done) {
+      const slug = slugOfResearch(l)
+      if (slug && !fs.existsSync(resultFile('verify__' + slug)) && fs.existsSync(taskFile('verify__' + slug))) pendingVerify.push('verify__' + slug)
+    }
+  }
+  if (before !== labels.length) console.log('Пропущено готовых задач: ' + (before - labels.length) + ' (--skip-done)' + (pendingVerify.length ? '; верификация ещё нужна: ' + pendingVerify.join(', ') : ''))
+  labels = [...labels, ...pendingVerify.filter(l => !labels.includes(l))]
   if (!labels.length) {
     console.log('Все задачи стадии уже сделаны. Дальше: node ' + script('status.mjs') + ' --root ' + shq(opts.root) +
       ' — следующая команда, затем node ' + script('audit.mjs') + ' --root ' + shq(opts.root))
@@ -607,30 +749,46 @@ if (opts.skipDone) {
   }
 }
 
-const jobs = labels.map(l => {
+function makeJob(l, chained = false) {
   const route = routeOfJob(l, opts, engine)
   const j = buildCommand(l, opts, opts.root, route)
   j.label = l
   j.cwd = opts.root
   j.route = route
+  j.chained = chained
   const schemaPath = j.schema || schemaFor(l, opts.root, false)
   j.schemaJson = null
   if (schemaPath) { try { j.schemaJson = JSON.parse(fs.readFileSync(schemaPath, 'utf8')) } catch (e) { j.schemaJson = null } }
   if (!j.schemaJson) console.error('Предупреждение: нет схемы возврата для ' + l + ' — результат проверяется только на наличие, не по схеме')
   return j
-})
+}
+
+const jobs = labels.map(l => makeJob(l))
+// Цепочка: какие верификаторы встанут следом и для каких тем их задачи не отрендерены.
+const chainFor = (job) => {
+  const slug = chain && slugOfResearch(job.label)
+  if (!slug) return null
+  const v = 'verify__' + slug
+  return fs.existsSync(taskFile(v)) ? v : null
+}
+const noVerifyTask = chain ? jobs.map(j => slugOfResearch(j.label)).filter(Boolean).filter(slug => !fs.existsSync(taskFile('verify__' + slug))) : []
+if (noVerifyTask.length) {
+  console.error('Предупреждение: нет задач верификатора для ' + noVerifyTask.join(', ') + ' — после ресерча верификация не пойдёт. Отрендерь: node ' +
+    script('render-tasks.mjs') + ' --root ' + shq(opts.root) + ' --stage research --labels ' + noVerifyTask.join(','))
+}
 
 console.log('Движок: ' + (engine.title || engine.slug || opts.root))
-console.log('Стадия: ' + (opts.stage || 'по списку labels') + ' · задач ' + jobs.length + ' · хост ' + opts.engine +
-  ' · параллельно ' + opts.concurrency + ' · таймаут ' + opts.timeoutSec + ' с · повторов ' + opts.retries)
+console.log('Стадия: ' + (opts.stage || 'по списку labels') + ' · задач ' + jobs.length +
+  (chain && jobs.some(j => chainFor(j)) ? ' + верификаторы следом (' + jobs.filter(j => chainFor(j)).length + ')' : '') +
+  ' · хост ' + opts.engine + ' · параллельно ' + opts.concurrency + ' · таймаут ' + opts.timeoutSec + ' с · повторов ' + opts.retries)
 
 // Честный рассказ про веб-поиск: recon, research и verify без него бессмысленны, остальным он не нужен.
 const webCount = jobs.filter(j => isWebJob(j.label)).length
 const webScope = !webCount ? 'не нужен ни одной задаче партии — стадии работают по корпусу на диске'
   : webCount === jobs.length ? 'нужен всем задачам партии' : 'нужен ' + webCount + ' из ' + jobs.length + ' задач (recon, research, verify)'
 if (opts.engine === 'codex') {
-  console.log('Веб-поиск: ' + webScope + '; -c tools.web_search=' + (opts.webSearch && webCount ? 'true' : 'false') + (webCount && webCount < jobs.length ? ' только у них' : '') +
-    (opts.strictConfig ? ' (с --strict-config: незнакомый ключ падает громко)' : ' (без --strict-config: незнакомый ключ будет проглочен молча)'))
+  console.log('Веб-поиск: ' + webScope + '; -c web_search="' + (opts.webSearch && webCount ? 'live' : 'disabled') + '"' + (webCount && webCount < jobs.length ? ' только у них' : '') +
+    (opts.strictConfig ? ' (с --strict-config: незнакомый ключ или значение падают громко)' : ' (без --strict-config: незнакомый ключ будет проглочен молча)'))
 } else {
   console.log('Веб-поиск: ' + webScope + '. У claude флага нет: WebSearch и WebFetch зависят от настроек сессии, ' +
     'требование поднять их вписано в промпт. Если в логе задачи поиска нет — включи их в settings.json хоста.')
@@ -644,11 +802,24 @@ if (!opts.webSearch && webJobs.length) {
     '). Без веб-поиска отчёт и разведка пишутся по памяти модели — это брак, а не экономия.')
 }
 
+// Режим субагентов Codex: тот же контракт, что у процесса, — промпт на задачу.
+if (opts.printPrompts) {
+  console.log('\n--print-prompts: промпты для субагентов (spawn_agent), по одному агенту на задачу. Верификатор темы — только после того, как её ресерчер вернул результат.\n')
+  const list = [...jobs, ...jobs.map(chainFor).filter(Boolean).map(l => makeJob(l, true))]
+  for (const j of list) {
+    console.log('=== ' + j.label + (j.chained ? ' · после ресерча темы' : '') + ' ===')
+    console.log(taskPrompt(opts.root, j.label, opts))
+    console.log('')
+  }
+  await flushAndExit(0)
+}
+
 if (opts.dryRun) {
   console.log('\n--dry-run: команды печатаются целиком, ничего не запускается.\n')
-  for (const j of jobs) {
-    console.log('# ' + j.label)
-    console.log('#   задача: ' + path.join(opts.root, 'state', 'tasks', j.label + '.md'))
+  const list = [...jobs, ...jobs.map(chainFor).filter(Boolean).map(l => makeJob(l, true))]
+  for (const j of list) {
+    console.log('# ' + j.label + (j.chained ? ' — встанет в очередь после успешного ресерча темы' : ''))
+    console.log('#   задача: ' + taskFile(j.label))
     console.log('#   лог:    ' + j.logPath)
     console.log('#   raw:    ' + j.rawPath)
     if (j.schema) console.log('#   схема:  ' + j.schema)
@@ -672,12 +843,24 @@ const onSignal = () => {
 process.on('SIGINT', onSignal)
 process.on('SIGTERM', onSignal)
 
+const queue = [...jobs]
 const t0 = Date.now()
-const results = await pool(jobs, opts)
+const results = await pool(queue, opts, (job, q) => {
+  const v = chainFor(job)
+  if (v && !q.some(x => x.label === v)) q.push(makeJob(v, true))
+})
 const totalSec = Math.round((Date.now() - t0) / 1000)
 
-table(jobs, results)
-appendRunLog(opts.root, opts, jobs, results, totalSec)
+// Верификаторы, которые не встали в очередь из-за упавшего ресерча, в итогах видны как «не запускалась».
+for (const j of jobs) {
+  const v = chainFor(j)
+  if (v && !queue.some(x => x.label === v)) queue.push(makeJob(v, true))
+}
+
+table(queue, results)
+appendRunLog(opts.root, opts, queue, results, totalSec)
+const recorded = opts.record ? recordUsage(opts.root, opts, queue, results, totalSec) : []
+const totalTokens = queue.reduce((a, j) => a + ((results.get(j.label) || {}).tokens || 0), 0)
 
 // Статусы тем и сводов — по тому, что агенты записали на диск.
 try {
@@ -688,15 +871,18 @@ try {
   console.error('Статусы не сверены с диском: ' + e.message + '. Сверь вручную: node ' + script('status.mjs') + ' --root ' + shq(opts.root) + ' --write')
 }
 
-const failed = jobs.filter(j => !(results.get(j.label) || {}).ok).map(j => j.label)
+const failed = queue.filter(j => !(results.get(j.label) || {}).ok).map(j => j.label)
 console.log('')
-console.log('Итого: ' + (jobs.length - failed.length) + '/' + jobs.length + ' за ' + Math.round(totalSec / 60) + ' мин.')
+console.log('Итого: ' + (queue.length - failed.length) + '/' + queue.length + ' за ' + Math.round(totalSec / 60) + ' мин' +
+  (totalTokens ? ', ' + fmt(totalTokens) + ' токенов' : '') + '.' +
+  (recorded.length ? ' Расход записан в engine.json (runs): ' + recorded.map(r => r.stage + ' — ' + r.agents + ' агентов').join('; ') + '.' : ''))
 if (fatal && !interrupted) {
   console.error('\nПрогон остановлен: ' + fatal)
 }
 if (failed.length) {
-  console.log('Упали: ' + failed.join(', '))
-  // повтор с теми же флагами: без них --engine claude --model haiku превращался в прогон на codex
+  console.log('Упали или не запускались: ' + failed.join(', '))
+  // повтор с теми же флагами: без них --engine claude --model haiku превращался в прогон на codex.
+  // Упавший верификатор повторяется сам по себе, без ресерча: отчёт уже на диске.
   const keep = []
   const src = process.argv.slice(2).flatMap(a => (/^--[a-z-]+=/.test(a) ? [a.slice(0, a.indexOf('=')), a.slice(a.indexOf('=') + 1)] : [a]))
   for (let i = 0; i < src.length; i++) {
@@ -704,16 +890,16 @@ if (failed.length) {
     if (src[i] === '--skip-done' || src[i] === '--dry-run') continue
     keep.push(src[i])
   }
-  console.log('Смотри логи в ' + path.join(opts.root, 'state', 'logs') + ', затем перезапусти только упавшие:')
+  console.log('Смотри логи в ' + path.join(opts.root, 'state', 'logs') + ', затем перезапусти только упавшие' +
+    (/лимит/.test(fatal) ? ' — после сброса лимита' : '') + ':')
   console.log('  node ' + script('fanout.mjs') + ' ' + keep.map(shq).join(' ') + ' --labels ' + failed.join(','))
   await flushAndExit(1)
 }
 const R = shq(opts.root)
-const stagesRun = new Set(jobs.map(j => stageOfLabel(j.label)))
-if (stagesRun.has('research')) {
-  const slugs = jobs.filter(j => j.label.startsWith('research__')).map(j => j.label.slice('research__'.length))
-  console.log('Дальше — верификация этих тем отдельным прогоном (fanout пишет только отчёт): node ' + script('fanout.mjs') + ' --root ' + R +
-    ' --stage verify --labels ' + slugs.map(x => 'verify__' + x).join(',') + ' --engine ' + opts.engine + ' (задачи верификатора рендерит render-tasks --stage research).')
+if (!chain && queue.some(j => j.label.startsWith('research__'))) {
+  const slugs = queue.filter(j => j.label.startsWith('research__')).map(j => j.label.slice('research__'.length))
+  console.log('Дальше — верификация этих тем (партия шла с --no-verify): node ' + script('fanout.mjs') + ' --root ' + R +
+    ' --stage verify --labels ' + slugs.map(x => 'verify__' + x).join(',') + ' --engine ' + opts.engine + '.')
 }
-console.log('Дальше: node ' + script('status.mjs') + ' --root ' + R + ' — статусы по диску и следующая команда; расход партии — status.mjs --record <стадия> --agents <N> --tokens <T>;')
+console.log('Дальше: node ' + script('status.mjs') + ' --root ' + R + ' — статусы по диску и следующая команда;')
 console.log('  затем node ' + script('audit.mjs') + ' --root ' + R + ' — проверка закона конвейера по этой стадии.')
