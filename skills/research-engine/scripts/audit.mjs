@@ -331,6 +331,15 @@ function checkQuestions(section, promptPath, promptText, reportPath, reportText)
   }
 }
 
+const lineCounts = new Map()
+function lineCount(abs) {
+  if (!lineCounts.has(abs)) {
+    const t = readText(abs) || ''
+    lineCounts.set(abs, t ? t.split('\n').length - (t.endsWith('\n') ? 1 : 0) : 0)
+  }
+  return lineCounts.get(abs)
+}
+
 function checkLinks(section, file, text) {
   const lines = text.split('\n')
   const mask = codeFenceMask(lines)
@@ -350,9 +359,23 @@ function checkLinks(section, file, text) {
       target = target.split('#')[0]
       if (!target) continue
       try { target = decodeURIComponent(target) } catch { /* оставляем как есть */ }
-      const abs = target.startsWith('/') ? target : path.resolve(dir, target)
+      let abs = target.startsWith('/') ? target : path.resolve(dir, target)
+      // «отчёт.md:11», «:11-20», «:11:5» — ссылка на строку файла: так адресуют агенты Codex,
+      // и так её открывают редакторы. Файл проверяем без хвоста, строку — по длине файла.
+      let lineNo = null
+      const at = /:(\d+)(?:[-–]\d+|:\d+)?$/.exec(abs)
+      if (at && !isFile(abs) && isFile(abs.slice(0, at.index))) {
+        abs = abs.slice(0, at.index)
+        lineNo = Number(at[1])
+      }
       if (!isFile(abs) && !isDir(abs)) {
         blocker(section, file, i + 1, 'broken-link', 'битая внутренняя ссылка: ' + target)
+      } else if (lineNo != null) {
+        const total = lineCount(abs)
+        if (lineNo < 1 || lineNo > total) {
+          blocker(section, file, i + 1, 'broken-link', 'ссылка на строку ' + lineNo + ' за пределами файла (' +
+            fmt(total) + ' ' + plural(total, 'строка', 'строки', 'строк') + '): ' + target)
+        }
       }
     }
   }

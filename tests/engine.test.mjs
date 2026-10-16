@@ -13,7 +13,7 @@ const SKILL = path.join(REPO, 'skills', 'research-engine')
 const SCRIPTS = path.join(SKILL, 'scripts')
 
 const LIB = await import(path.join(SCRIPTS, 'lib', 'engine.mjs'))
-const { todayISO } = LIB
+const { todayISO, countWords } = LIB
 
 function run(name, args, env) {
   const r = spawnSync(process.execPath, [path.join(SCRIPTS, name), ...args], { encoding: 'utf8', env: env ? { ...process.env, ...env } : process.env })
@@ -982,4 +982,39 @@ test('audit: диапазон с минусом и заглушка ссылки
   writeReport(root, '01-alpha', '# a\n\nОкно недели −8…−1 до правки; ссылки [S…] — по нумерации отчёта. Список и т.д.\n')
   const c = audit(root, 'research').findings.filter(x => x.code === 'compression').map(x => x.message)
   assert.deepEqual(c, ['след сжатия: «и т.д.» — разверни пункт вместо отсылки'])
+})
+
+test('audit: ссылка «файл.md:строка» на существующий файл — не битая; строка за концом файла — блокер', () => {
+  const root = makeEngine()
+  writeReport(root, '02-beta', '# b\n\nстрока 3\nстрока 4\n')
+  const rep = path.join(root, 'reports', '02-beta.md')
+  writeReport(root, '01-alpha', '# a\n\n[ок](02-beta.md:3) [диапазон](./02-beta.md:3-4) [абс](' + rep + ':4) [колонка](02-beta.md:3:7) [далеко](02-beta.md:99) [нет](nope.md:1)\n')
+  const broken = audit(root, 'research').findings.filter(x => x.code === 'broken-link').map(x => x.message)
+  assert.equal(broken.length, 2, broken.join('\n'))
+  assert.ok(broken.some(m => /строку 99 за пределами файла \(4 строки\): 02-beta\.md:99/.test(m)), broken.join('\n'))
+  assert.ok(broken.some(m => m === 'битая внутренняя ссылка: nope.md:1'), broken.join('\n'))
+})
+
+test('каждая задача кончается своим каталогом для рабочих файлов и счётчиком слов движка', () => {
+  const root = makeEngine()
+  assert.equal(run('render-tasks.mjs', ['--root', root, '--stage', 'research']).code, 0)
+  for (const label of ['research__01-alpha', 'verify__01-alpha']) {
+    const t = fs.readFileSync(path.join(root, 'state', 'tasks', label + '.md'), 'utf8')
+    assert.match(t, /## Рабочие файлы и подсчёт слов\n/)
+    assert.ok(t.includes('`' + path.join(root, 'state', 'scratch', label) + '/`'), label)
+    assert.match(t, /words\.mjs'? <файл>`/)
+  }
+})
+
+test('words.mjs считает тем же счётчиком, что аудит, и печатает JSON', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 're-words-'))
+  const f = path.join(dir, 'r.md')
+  const text = '# Отчёт\n\n`codex exec --output-schema` см. https://platform.openai.com/docs и 2026-10-16.\n'
+  fs.writeFileSync(f, text)
+  const plain = run('words.mjs', [f])
+  assert.equal(plain.code, 0, plain.err)
+  assert.equal(plain.out.trim(), countWords(text) + '  ' + f)
+  assert.notEqual(countWords(text), text.split(/\s+/).filter(Boolean).length)
+  assert.deepEqual(JSON.parse(run('words.mjs', ['--json', f]).out), { [f]: countWords(text) })
+  assert.notEqual(run('words.mjs', []).code, 0)
 })
