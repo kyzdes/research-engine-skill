@@ -1,7 +1,7 @@
 {
   "name": "research-engine",
-  "version": "0.5.1",
-  "description": "Собирает по теме верифицированную базу знаний и методику поверх неё: ТЗ на ресерч, отчёты с верификаторами, своды, банк фактов, критик полноты, METHOD.md.",
+  "version": "0.6.0",
+  "description": "Собирает по теме верифицированную базу знаний и методику поверх неё: ТЗ на ресерч, отчёты с верификаторами, своды, банк фактов, критик полноты, METHOD.md. Второй скилл, research-pipeline, — ресерч по множеству объектов: реестр в Agentix Notes, случайная выборка с калибровкой, партии, отчёт из SQL.",
   "author": {
     "name": "kyzdes",
     "url": "https://github.com/kyzdes"
@@ -14,7 +14,9 @@
     "multi-agent",
     "knowledge-base",
     "synthesis",
-    "verification"
+    "verification",
+    "dataset",
+    "sampling"
   ],
   "skills": "./skills/",
   "interface": {
