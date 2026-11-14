@@ -26,3 +26,5 @@ jobs:
       - run: python tests/test_auto_update.py
         env:
           PYTHONDONTWRITEBYTECODE: '1'
+      # research-pipeline: canonical keys, stdlib only, same Python floor (3.9) and the three OSes
+      - run: python -B -m unittest discover -s skills/research-pipeline/tests -v

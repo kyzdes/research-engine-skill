@@ -1,0 +1,455 @@
+{
+ "project": "Research",
+ "database": "research",
+ "description": "Общая база ресерчей research-pipeline: задачи, объекты, оценки объекта в задаче, источники, факты с происхождением, журнал поисков и связи. Объекты и факты общие для всех задач, оценка — своя у каждой.",
+ "tables": [
+  {
+   "table": "tasks",
+   "key": [
+    "slug"
+   ],
+   "description": "Один ресерч — одна строка: карточка задачи. Полная карточка — заметка <slug>/TASK.",
+   "columns": [
+    {
+     "name": "slug",
+     "type": "text",
+     "description": "Короткий id задачи: ai-teachers-ru"
+    },
+    {
+     "name": "title",
+     "type": "text",
+     "description": "Название"
+    },
+    {
+     "name": "mode",
+     "type": "text",
+     "description": "corpus / questions / both"
+    },
+    {
+     "name": "status",
+     "type": "text",
+     "description": "interview / planned / discovery / sampling / running / reporting / done / paused"
+    },
+    {
+     "name": "unit",
+     "type": "text",
+     "description": "Единица анализа: одна строка реестра — это kind из словаря (person, tool, repo, post…)"
+    },
+    {
+     "name": "output",
+     "type": "text",
+     "description": "list / compare / findings / answer / method"
+    },
+    {
+     "name": "goal",
+     "type": "text",
+     "description": "Какое решение примут по итогам"
+    },
+    {
+     "name": "scope",
+     "type": "json",
+     "description": "Периметр: {lang, geo, since, until, platforms}"
+    },
+    {
+     "name": "include",
+     "type": "json",
+     "description": "Критерии «по делу», список строк"
+    },
+    {
+     "name": "exclude",
+     "type": "json",
+     "description": "Критерии «мимо», список строк"
+    },
+    {
+     "name": "schema",
+     "type": "json",
+     "description": "Предметные поля: [{name, type, unit, values, required, answers, evidence, how}]"
+    },
+    {
+     "name": "acceptance",
+     "type": "json",
+     "description": "Приёмочные вопросы: [{id, q}]"
+    },
+    {
+     "name": "known_items",
+     "type": "json",
+     "description": "Ключи объектов, которые обязаны найтись; в поиск затравкой не идут"
+    },
+    {
+     "name": "budget",
+     "type": "json",
+     "description": "{items, requests, hours, money_usd}"
+    },
+    {
+     "name": "autonomy",
+     "type": "text",
+     "description": "ask_all / gates / auto"
+    },
+    {
+     "name": "fields_table",
+     "type": "text",
+     "description": "Таблица предметных полей задачи: t_<slug>"
+    },
+    {
+     "name": "task_note",
+     "type": "note",
+     "description": "Заметка <slug>/TASK"
+    },
+    {
+     "name": "report_note",
+     "type": "note",
+     "description": "Заметка <slug>/REPORT"
+    },
+    {
+     "name": "last_run",
+     "type": "date",
+     "description": "Дата последнего прогона"
+    },
+    {
+     "name": "review_after",
+     "type": "date",
+     "description": "Когда прогнать повторно"
+    }
+   ]
+  },
+  {
+   "table": "items",
+   "key": [
+    "id"
+   ],
+   "description": "Объекты: то, что изучаем, без привязки к задаче. Ключ — канонический (scripts/canon.py).",
+   "columns": [
+    {
+     "name": "id",
+     "type": "text",
+     "description": "Канонический ключ: github:owner/name, instagram:p/<shortcode>, person:<handle>, web:<домен><путь>"
+    },
+    {
+     "name": "kind",
+     "type": "text",
+     "description": "person, org, account, product, tool, repo, course, community, post, video, article, paper, dataset, event, other"
+    },
+    {
+     "name": "name",
+     "type": "text",
+     "description": "Человекочитаемое имя"
+    },
+    {
+     "name": "aliases",
+     "type": "json",
+     "description": "Другие имена, хэндлы, написания"
+    },
+    {
+     "name": "primary_url",
+     "type": "url",
+     "description": "Главный адрес"
+    },
+    {
+     "name": "urls",
+     "type": "json",
+     "description": "Все известные адреса"
+    },
+    {
+     "name": "access",
+     "type": "text",
+     "description": "open / partial / login / paywall / removed / geo_blocked / error / unknown"
+    },
+    {
+     "name": "merged_into",
+     "type": "text",
+     "description": "Ключ объекта, в который склеен этот дубль"
+    },
+    {
+     "name": "checked_at",
+     "type": "date",
+     "description": "Когда последний раз сверяли"
+    },
+    {
+     "name": "review_after",
+     "type": "date",
+     "description": "Когда сверить снова (звёзды, цены, подписчики)"
+    }
+   ]
+  },
+  {
+   "table": "assessments",
+   "key": [
+    "task",
+    "item"
+   ],
+   "description": "Оценка объекта в задаче: стадия, вердикт, полнота, откуда найден. Отсеянные не удаляются — у них relevance=no.",
+   "columns": [
+    {
+     "name": "task",
+     "type": "text",
+     "description": "tasks.slug"
+    },
+    {
+     "name": "item",
+     "type": "text",
+     "description": "items.id"
+    },
+    {
+     "name": "stage",
+     "type": "text",
+     "description": "candidate / screened / processed / done / parked"
+    },
+    {
+     "name": "relevance",
+     "type": "text",
+     "description": "unknown / yes / partial / no"
+    },
+    {
+     "name": "reason",
+     "type": "text",
+     "description": "Когда relevance не yes: off_topic / out_of_scope / promo / outdated / low_quality / too_shallow / no_access / unverifiable"
+    },
+    {
+     "name": "why",
+     "type": "text",
+     "description": "Одна строка: почему такой вердикт"
+    },
+    {
+     "name": "completeness",
+     "type": "text",
+     "description": "full / partial / stub"
+    },
+    {
+     "name": "missing",
+     "type": "text",
+     "description": "Чего не хватает, если неполно"
+    },
+    {
+     "name": "found_by",
+     "type": "text",
+     "description": "searches.id, первым нашедший объект"
+    },
+    {
+     "name": "sampled",
+     "type": "boolean",
+     "description": "Попал в случайную выборку"
+    },
+    {
+     "name": "user_label",
+     "type": "text",
+     "description": "Вердикт пользователя на калибровке: yes / partial / no"
+    },
+    {
+     "name": "priority",
+     "type": "integer",
+     "description": "Порядок разбора: меньше — раньше"
+    },
+    {
+     "name": "batch",
+     "type": "integer",
+     "description": "Номер партии прохода"
+    },
+    {
+     "name": "decision",
+     "type": "text",
+     "description": "Ставит пользователь позже: applied / rejected / watching"
+    },
+    {
+     "name": "note",
+     "type": "note",
+     "description": "Заметка с разбором объекта"
+    }
+   ]
+  },
+  {
+   "table": "sources",
+   "key": [
+    "url"
+   ],
+   "description": "Адреса, которые открывали: откуда, когда, через какой инструмент, удалось ли.",
+   "columns": [
+    {
+     "name": "url",
+     "type": "url",
+     "description": "Нормализованный адрес (scripts/canon.py)"
+    },
+    {
+     "name": "platform",
+     "type": "text",
+     "description": "instagram, youtube, github, telegram, x, web…"
+    },
+    {
+     "name": "source_type",
+     "type": "text",
+     "description": "primary / secondary / aggregator / opinion / promo / unknown"
+    },
+    {
+     "name": "author",
+     "type": "text",
+     "description": "Автор или владелец"
+    },
+    {
+     "name": "published_at",
+     "type": "date",
+     "description": "Дата публикации, если видна"
+    },
+    {
+     "name": "fetched_at",
+     "type": "date",
+     "description": "Когда открыли"
+    },
+    {
+     "name": "fetched_via",
+     "type": "text",
+     "description": "Инструмент: web_extract, browser, ig.py, yt-dlp, gh…"
+    },
+    {
+     "name": "access",
+     "type": "text",
+     "description": "open / partial / login / paywall / removed / geo_blocked / error / unknown"
+    },
+    {
+     "name": "snapshot",
+     "type": "text",
+     "description": "Файл копии в Notes, если сохранили"
+    }
+   ]
+  },
+  {
+   "table": "facts",
+   "key": [
+    "item",
+    "attribute",
+    "source"
+   ],
+   "description": "Значения полей объектов с происхождением. Не перезаписываются: противоречие — два факта с разными value.",
+   "columns": [
+    {
+     "name": "item",
+     "type": "text",
+     "description": "items.id"
+    },
+    {
+     "name": "attribute",
+     "type": "text",
+     "description": "Имя поля из схемы задачи"
+    },
+    {
+     "name": "value",
+     "type": "text",
+     "description": "Значение строкой; число без единиц"
+    },
+    {
+     "name": "unit",
+     "type": "text",
+     "description": "Единица: RUB/month, stars, followers"
+    },
+    {
+     "name": "source",
+     "type": "url",
+     "description": "sources.url"
+    },
+    {
+     "name": "locator",
+     "type": "text",
+     "description": "Где именно: таймкод, слайд, раздел, короткая цитата"
+    },
+    {
+     "name": "observed_at",
+     "type": "date",
+     "description": "На какую дату значение верно"
+    },
+    {
+     "name": "level",
+     "type": "text",
+     "description": "claimed / observed / corroborated / verified"
+    }
+   ]
+  },
+  {
+   "table": "searches",
+   "key": [
+    "id"
+   ],
+   "description": "Журнал поисков: что, как и чем искали, сколько нашли нового. Из него — насыщение и выход по источникам.",
+   "columns": [
+    {
+     "name": "id",
+     "type": "text",
+     "description": "<task>:s<NNN>"
+    },
+    {
+     "name": "task",
+     "type": "text",
+     "description": "tasks.slug"
+    },
+    {
+     "name": "strategy",
+     "type": "text",
+     "description": "search / snowball / directory / enumerate / list / manual"
+    },
+    {
+     "name": "query",
+     "type": "text",
+     "description": "Запрос, адрес каталога или ключ родителя"
+    },
+    {
+     "name": "tool",
+     "type": "text",
+     "description": "web_search, browser, ig.py, gh, keenable-harvest, user…"
+    },
+    {
+     "name": "fallback_from",
+     "type": "text",
+     "description": "Какой инструмент не сработал перед этим"
+    },
+    {
+     "name": "parent_item",
+     "type": "text",
+     "description": "Для snowball: от какого объекта пошли"
+    },
+    {
+     "name": "ran_at",
+     "type": "date",
+     "description": "Когда"
+    },
+    {
+     "name": "results",
+     "type": "integer",
+     "description": "Сколько результатов вернул"
+    },
+    {
+     "name": "new_unique",
+     "type": "integer",
+     "description": "Сколько из них новые объекты для задачи"
+    }
+   ]
+  },
+  {
+   "table": "links",
+   "key": [
+    "from_item",
+    "rel",
+    "to_item"
+   ],
+   "description": "Связи объектов: человек владеет аккаунтами, автор курса, упоминает, подписан.",
+   "columns": [
+    {
+     "name": "from_item",
+     "type": "text",
+     "description": "items.id"
+    },
+    {
+     "name": "rel",
+     "type": "text",
+     "description": "owns / authored / part_of / mentions / follows / cites / alternative_to"
+    },
+    {
+     "name": "to_item",
+     "type": "text",
+     "description": "items.id"
+    },
+    {
+     "name": "source",
+     "type": "url",
+     "description": "Откуда известно"
+    }
+   ]
+  }
+ ]
+}
